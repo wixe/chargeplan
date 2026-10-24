@@ -201,7 +201,8 @@ public final class UnixSocketServer {
             }
             
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: sourcePath),
-                  let fileSize = attrs[.size] as? Int64, fileSize > 50_000 else {
+                  let fileSize = (attrs[.size] as? Int64) ?? (attrs[.size] as? Int).map(Int64.init),
+                  fileSize > 50_000 else {
                 return "{\"error\":\"Source binary is invalid or corrupt\"}\n"
             }
             
@@ -212,18 +213,44 @@ public final class UnixSocketServer {
             try? FileManager.default.createDirectory(atPath: daemonDir, withIntermediateDirectories: true)
             try? FileManager.default.createDirectory(atPath: "/usr/local/bin", withIntermediateDirectories: true)
             
-            // Atomically install the new binary to both locations
-            let p1 = Process()
-            p1.executableURL = URL(fileURLWithPath: "/usr/bin/install")
-            p1.arguments = ["-m", "755", sourcePath, daemonBin]
-            try? p1.run()
-            p1.waitUntilExit()
-            
-            let p2 = Process()
-            p2.executableURL = URL(fileURLWithPath: "/usr/bin/install")
-            p2.arguments = ["-m", "755", sourcePath, cliBin]
-            try? p2.run()
-            p2.waitUntilExit()
+            // /usr/bin/install can leave a busy Mach-O untouched and still exit.
+            // Fall back to copy-and-replace, and do not claim success unless the
+            // destination is the new file.
+            func installedSize(_ path: String) -> Int64? {
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+                if let size = attrs[.size] as? Int64 { return size }
+                if let size = attrs[.size] as? Int { return Int64(size) }
+                if let size = attrs[.size] as? NSNumber { return size.int64Value }
+                return nil
+            }
+            func installBinary(from source: String, to dest: String) -> Bool {
+                let installer = Process()
+                installer.executableURL = URL(fileURLWithPath: "/usr/bin/install")
+                installer.arguments = ["-m", "755", source, dest]
+                try? installer.run()
+                installer.waitUntilExit()
+                if installer.terminationStatus == 0, installedSize(dest) == fileSize {
+                    return true
+                }
+                let tmp = dest + ".new"
+                do {
+                    if FileManager.default.fileExists(atPath: tmp) {
+                        try FileManager.default.removeItem(atPath: tmp)
+                    }
+                    try FileManager.default.copyItem(atPath: source, toPath: tmp)
+                    if FileManager.default.fileExists(atPath: dest) {
+                        try FileManager.default.removeItem(atPath: dest)
+                    }
+                    try FileManager.default.moveItem(atPath: tmp, toPath: dest)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest)
+                    return installedSize(dest) == fileSize
+                } catch {
+                    return false
+                }
+            }
+            guard installBinary(from: sourcePath, to: daemonBin), installBinary(from: sourcePath, to: cliBin) else {
+                return "{\"error\":\"Failed to install the new ChargePlan binary\"}\n"
+            }
             
             for path in [daemonBin, cliBin] {
                 let xattr = Process()
@@ -365,11 +392,34 @@ public enum UnixSocketClient {
         }
         return nil
     }
+
+    /// True when the daemon accepted the command. Pretty-printed and compact JSON both count.
+    public static func isSuccess(_ response: String?) -> Bool {
+        guard let response,
+              let data = response.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        if let ok = obj["success"] as? Bool {
+            return ok
+        }
+        if let number = obj["success"] as? NSNumber {
+            return number.boolValue
+        }
+        return false
+    }
     
     private static func sendDirect(_ command: String, socketPath: String) -> String? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
+
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var timeout = timeval(tv_sec: 8, tv_usec: 0)
+        let timeoutLen = socklen_t(MemoryLayout<timeval>.size)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, timeoutLen)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, timeoutLen)
         
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -391,16 +441,22 @@ public enum UnixSocketClient {
         guard connected == 0 else { return nil }
         
         let payload = command.hasSuffix("\n") ? command : (command + "\n")
-        _ = payload.withCString { cStr in
+        let written = payload.withCString { cStr in
             write(fd, cStr, strlen(cStr))
         }
+        guard written > 0 else { return nil }
+        _ = shutdown(fd, SHUT_WR)
         
         var output = Data()
         var buf = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = read(fd, &buf, buf.count)
-            if n <= 0 { break }
-            output.append(buf, count: n)
+            if n > 0 {
+                output.append(buf, count: n)
+                continue
+            }
+            if n < 0 && errno == EINTR { continue }
+            break
         }
         return output.isEmpty ? nil : String(data: output, encoding: .utf8)
     }

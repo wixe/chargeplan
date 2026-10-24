@@ -342,7 +342,7 @@ final class BatteryGraphView: NSView {
 }
 
 @MainActor
-final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var refreshTimer: Timer?
     private var windowTelemetryTimer: Timer?
@@ -368,6 +368,11 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var latestRelease: ReleaseInfo?
     private var isUpdatingApp: Bool = false
     private var isAutoSyncingDaemon: Bool = false
+    private var menuIsOpen = false
+    private var replacingMenu = false
+    private var controlNotice: String?
+    private var controlNoticeUntil = Date.distantPast
+    private var lastAutoSyncAttempt = Date.distantPast
     private var updateStatusText: String = ""
     private var updateBox: NSBox?
     private var updateLabel: NSTextField?
@@ -443,6 +448,10 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     }
     
     private func rebuildMenu() {
+        guard !menuIsOpen else { return }
+        replacingMenu = true
+        defer { replacingMenu = false }
+
         let status = monitor.getCurrentStatus()
         let cfg = ConfigManager.shared.load()
         let daemonInfo = fetchDaemonStatus()
@@ -454,6 +463,7 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         statusItem.button?.title = "\(iconPrefix) \(status.percent)% → \(cfg.targetLimit)%"
         
         let menu = NSMenu()
+        menu.delegate = self
         
         if let rel = latestRelease, UpdateChecker.isVersion(rel.version, newerThan: ChargePlanVersion) {
             let updateItem = NSMenuItem(title: "⬆️ Update Available (\(rel.tagName))…", action: #selector(triggerAppUpdate), keyEquivalent: "")
@@ -592,6 +602,17 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         menu.addItem(quitItem)
         
         statusItem.menu = menu
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+        if !replacingMenu {
+            rebuildMenu()
+        }
     }
     
     @objc private func yAxisSegmentChanged(_ sender: NSSegmentedControl) {
@@ -962,30 +983,33 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     
     private func autoSyncDaemonIfNeeded() {
         guard !isAutoSyncingDaemon else { return }
+        if lastAutoSyncAttempt != .distantPast, Date().timeIntervalSince(lastAutoSyncAttempt) < 60 {
+            return
+        }
         let daemonInfo = fetchDaemonStatus()
         guard daemonInfo.running else { return }
         let upToDate = isDaemonBinaryUpToDate(runningDaemonVersion: daemonInfo.version)
         guard !upToDate else { return }
         
         isAutoSyncingDaemon = true
+        lastAutoSyncAttempt = Date()
         let bundled = bundledCLIBinaryPath()
         
-        Task {
-            // 1. Try seamless zero-password socket UPGRADE first
-            if let resp = UnixSocketClient.send("UPGRADE \(bundled)"), resp.contains("\"success\":true") {
+        // Socket UPGRADE only. An older daemon that rejects it stays on the
+        // explicit "Update Background Daemon" menu item, which the user chooses.
+        Task.detached { [weak self] in
+            let response = UnixSocketClient.send("UPGRADE \(bundled)")
+            let ok = UnixSocketClient.isSuccess(response)
+            if ok {
                 try? await Task.sleep(nanoseconds: 600_000_000)
-                await MainActor.run {
-                    self.isAutoSyncingDaemon = false
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isAutoSyncingDaemon = false
+                if ok {
                     self.rebuildMenu()
                     self.refreshSettingsWindow()
                 }
-                return
-            }
-            
-            // 2. Fallback to privileged install if older running daemon does not support socket UPGRADE
-            await MainActor.run {
-                self.installDaemonAction()
-                self.isAutoSyncingDaemon = false
             }
         }
     }
@@ -998,6 +1022,15 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let daemonActive = daemonInfo.running
         let upToDate = isDaemonBinaryUpToDate(runningDaemonVersion: daemonInfo.version)
         let govMode = daemonInfo.mode
+        
+        if let notice = controlNotice, Date() < controlNoticeUntil {
+            governorLabel?.stringValue = notice
+            governorLabel?.textColor = .systemRed
+        } else {
+            controlNotice = nil
+            governorLabel?.stringValue = "Control Mode: \(govMode)"
+            governorLabel?.textColor = .labelColor
+        }
         
         if daemonActive && upToDate {
             daemonBadgeLabel?.stringValue = "✅ Background Controller Daemon Active & Running"
@@ -1028,7 +1061,6 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let stateStr = status.isCharging ? "⚡ Charging" : (status.isACConnected ? "🔌 AC Connected (Not Charging)" : "🔋 On Battery")
         let pctStr = String(format: "%.2f%%", status.exactPercent)
         batteryLabel?.stringValue = "Battery: \(pctStr) (\(stateStr))  •  Target: \(cfg.targetLimit)%  •  Live (1s poll)"
-        governorLabel?.stringValue = "Control Mode: \(govMode)"
         let capText = status.remainingCapacityMAh > 0 ? "Capacity: \(status.remainingCapacityMAh) / \(status.fullChargeCapacityMAh) mAh • " : ""
         telemetryLabel?.stringValue = String(format: "%.2fW (%d mV, %d mA) • %@Health: %.1f%% (%d cycles) • %@", abs(status.wattageW), status.voltageMV, status.amperageMA, capText, status.healthPercent, status.cycleCount, status.thermalState)
         
@@ -1080,55 +1112,50 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     
     @objc private func applySliderLimit() {
         let val = limitSlider?.integerValue ?? 50
-        applyLimitWithAdminPrompt(val)
+        applyLimit(val)
     }
     
     @objc private func selectPresetLimit(_ sender: NSMenuItem) {
-        let val = sender.tag
-        limitSlider?.integerValue = val
-        limitValueLabel?.stringValue = "\(val)%"
-        applyLimitWithAdminPrompt(val)
+        applyLimit(sender.tag)
     }
     
     @objc private func selectDriftOption(_ sender: NSMenuItem) {
         let margin = sender.tag
         let cmd = margin > 0 ? "DRIFT on \(margin)" : "DRIFT off"
-        if let resp = UnixSocketClient.send(cmd), resp.contains("\"success\":true") {
-            rebuildMenu()
-            refreshSettingsWindow()
-            return
-        }
-        if margin > 0 {
-            runPrivilegedCLI("drift on \(margin)")
-        } else {
-            runPrivilegedCLI("drift off")
-        }
-        rebuildMenu()
-        refreshSettingsWindow()
+        sendControl(cmd, failure: "Drift was not changed.")
     }
     
     @objc private func toggleDriftCheckbox(_ sender: NSButton) {
         let on = (sender.state == .on)
         let cmd = "DRIFT \(on ? "on 3" : "off")"
-        if let resp = UnixSocketClient.send(cmd), resp.contains("\"success\":true") {
-            rebuildMenu()
-            refreshSettingsWindow()
-            return
-        }
-        runPrivilegedCLI(cmd.lowercased())
-        rebuildMenu()
-        refreshSettingsWindow()
+        sendControl(cmd, failure: "Drift was not changed.")
     }
     
-    private func applyLimitWithAdminPrompt(_ limit: Int) {
-        if let resp = UnixSocketClient.send("SET \(limit)"), resp.contains("\"success\":true") {
-            rebuildMenu()
-            refreshSettingsWindow()
-            return
+    /// Menu presets and the settings slider talk only to the running daemon.
+    /// Install and uninstall still ask for an administrator when the user chooses them.
+    private func applyLimit(_ limit: Int) {
+        let clamped = max(30, min(100, limit))
+        limitSlider?.integerValue = clamped
+        limitValueLabel?.stringValue = "\(clamped)%"
+        sendControl("SET \(clamped)", failure: "Target was not changed.")
+    }
+
+    private func sendControl(_ command: String, failure: String) {
+        Task.detached { [weak self] in
+            let response = UnixSocketClient.send(command)
+            let ok = UnixSocketClient.isSuccess(response)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if ok {
+                    self.controlNotice = nil
+                } else {
+                    self.controlNotice = "The background controller did not accept the change. \(failure)"
+                    self.controlNoticeUntil = Date().addingTimeInterval(6)
+                }
+                self.rebuildMenu()
+                self.refreshSettingsWindow()
+            }
         }
-        runPrivilegedCLI("set \(limit)")
-        rebuildMenu()
-        refreshSettingsWindow()
     }
     
     private func bundledCLIBinaryPath() -> String {
@@ -1142,18 +1169,6 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             return "/usr/local/bin/chargeplan"
         }
         return "/usr/local/bin/chargeplan"
-    }
-    
-    private func runPrivilegedCLI(_ subcommand: String) {
-        let cliPath = FileManager.default.isExecutableFile(atPath: "/usr/local/bin/chargeplan")
-            ? "/usr/local/bin/chargeplan"
-            : bundledCLIBinaryPath()
-        let script = "do shell script \"'\(cliPath)' \(subcommand)\" with administrator privileges"
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        try? proc.run()
-        proc.waitUntilExit()
     }
     
     @objc private func installDaemonAction() {

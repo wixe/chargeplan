@@ -138,17 +138,19 @@ public class AIGovernor {
         }
     }
     
-    /// Republish only when powerd is advertising a different ceiling. A matching
-    /// ceiling is left alone, including while the pack discharges down to it.
+    /// Republish when powerd is advertising a different ceiling, or when the
+    /// pack is charging above the hold anyway. A matching ceiling is left
+    /// alone, including while the pack discharges down to it. An unreadable
+    /// pmset capture is not proof the ceiling is gone.
     private func publishNativeCeilingIfNeeded(target: Int, status: BatteryStatus) {
         let enforced = hardware.powerdSocLimit()
-        if enforced == target {
+        let lowerBound = max(20, target - (config.driftEnabled ? config.driftMargin : 1))
+        let chargingAboveHold = status.amperageMA > 50 && status.percent > lowerBound
+        if enforced == target && !chargingAboveHold {
             state.isChargingInhibited = target < 100
             return
         }
-        // A failed pmset read is not proof that the ceiling is gone. Republishing
-        // on that signal rewrites the preference and hangs up PowerUIAgent forever.
-        if enforced == nil && !hardware.powerdReportedNoCeiling() {
+        if enforced == nil && !hardware.powerdReportedNoCeiling() && !chargingAboveHold {
             return
         }
         let now = Date()

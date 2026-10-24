@@ -25,6 +25,9 @@ public class HardwareBackend {
     private var lastPublishAt: Date = .distantPast
     private var powerdCache: (at: Date, value: Int?, explicitNone: Bool)?
     private let powerdLock = NSLock()
+    /// enableMCL: is the 80–100 XPC path. Calling it while a sub-80 ceiling is
+    /// installed puts Apple's default back and the pack charges toward full.
+    private var didArmMCL = false
     
     public init() {
         self.smcDriver = SMCDriver()
@@ -307,14 +310,19 @@ public class HardwareBackend {
     
     private func cachedCeiling() -> (value: Int?, explicitNone: Bool) {
         powerdLock.lock()
-        defer { powerdLock.unlock() }
         if let cache = powerdCache, Date().timeIntervalSince(cache.at) < 2 {
-            return (cache.value, cache.explicitNone)
+            let cached = (cache.value, cache.explicitNone)
+            powerdLock.unlock()
+            return cached
         }
+        powerdLock.unlock()
+
         let text = Self.readPmsetBattlimit()
         let value = Self.parsePowerdSocLimits(text).max()
         let explicitNone = value == nil && text.contains("No battery level limits set")
+        powerdLock.lock()
         powerdCache = (Date(), value, explicitNone)
+        powerdLock.unlock()
         return (value, explicitNone)
     }
     
@@ -340,10 +348,10 @@ public class HardwareBackend {
         return values
     }
     
-    /// powerd's registered ceilings. Stdout and stderr are read separately:
-    /// a shared pipe under launchd came back empty, and an empty capture is
-    /// not the same thing as "No battery level limits set". If the direct
-    /// read has no ceiling, ask again as the console user.
+    /// powerd's registered ceilings. An empty capture is not "No battery level
+    /// limits set": launchd often cannot see the session's policy, so a miss
+    /// is tried again as the console user. The text that actually contains a
+    /// ceiling wins.
     private static func readPmsetBattlimit() -> String {
         let direct = runCommand("/usr/bin/pmset", ["-g", "battlimit"])
         if !parsePowerdSocLimits(direct.output).isEmpty {
@@ -355,32 +363,45 @@ public class HardwareBackend {
                 return bounced.output
             }
             logBattlimitRead(direct: direct, bounced: bounced, uid: uid)
-            return direct.output.isEmpty ? bounced.output : direct.output
+            return longerBattlimitText(direct.output, bounced.output)
         }
         logBattlimitRead(direct: direct, bounced: nil, uid: nil)
         return direct.output
     }
+
+    private static func longerBattlimitText(_ first: String, _ second: String) -> String {
+        if second.count > first.count { return second }
+        return first
+    }
     
     private static let battlimitLogLock = NSLock()
-    private static var didLogBattlimitRead = false
+    private static var lastBattlimitLog = ""
+    private static var lastBattlimitLogAt = Date.distantPast
     
-    /// One line in the daemon log when neither read shows a ceiling, so a
-    /// LaunchDaemon that cannot see powerd does not fail silently.
+    /// Log when neither read shows a ceiling. Repeated identical misses are
+    /// collapsed so a LaunchDaemon does not fill the log every poll.
     private static func logBattlimitRead(
         direct: (status: Int32, output: String),
         bounced: (status: Int32, output: String)?,
         uid: uid_t?
     ) {
-        battlimitLogLock.lock()
-        defer { battlimitLogLock.unlock() }
-        guard !didLogBattlimitRead else { return }
-        didLogBattlimitRead = true
         func flat(_ text: String) -> String {
-            String(text.prefix(180)).replacingOccurrences(of: "\n", with: " ")
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return "empty" }
+            return String(trimmed.prefix(180)).replacingOccurrences(of: "\n", with: " ")
         }
         let bouncedText = bounced.map { " asuser=\($0.status):\(flat($0.output))" } ?? ""
         let uidText = uid.map(String.init) ?? "none"
-        fputs("pmset battlimit unreadable direct=\(direct.status):\(flat(direct.output))\(bouncedText) console=\(uidText)\n", stdout)
+        let line = "pmset battlimit unreadable direct=\(direct.status):\(flat(direct.output))\(bouncedText) console=\(uidText)\n"
+        battlimitLogLock.lock()
+        defer { battlimitLogLock.unlock() }
+        let now = Date()
+        if line == lastBattlimitLog && now.timeIntervalSince(lastBattlimitLogAt) < 600 {
+            return
+        }
+        lastBattlimitLog = line
+        lastBattlimitLogAt = now
+        fputs(line, stdout)
         fflush(stdout)
     }
     
@@ -392,48 +413,83 @@ public class HardwareBackend {
         return uid
     }
     
-    private final class CommandOutput: @unchecked Sendable {
-        var out = Data()
-        var err = Data()
-    }
-    
+    /// posix_spawn plus a timed read. Swift's Process pipes come back empty
+    /// under a LaunchDaemon, and an empty capture must not be treated as
+    /// "no ceiling".
     @discardableResult
     private static func runCommand(_ path: String, _ args: [String]) -> (status: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        process.standardInput = FileHandle.nullDevice
-        var environment = ProcessInfo.processInfo.environment
-        if environment["PATH"]?.isEmpty != false {
-            environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
-        }
-        process.environment = environment
-        do {
-            try process.run()
-        } catch {
+        var pipes = [Int32](repeating: -1, count: 2)
+        guard pipe(&pipes) == 0 else { return (-1, "") }
+        let readFD = pipes[0]
+        let writeFD = pipes[1]
+
+        var actions: posix_spawn_file_actions_t?
+        guard posix_spawn_file_actions_init(&actions) == 0 else {
+            close(readFD)
+            close(writeFD)
             return (-1, "")
         }
-        let box = CommandOutput()
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            box.out = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_adddup2(&actions, writeFD, STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&actions, writeFD, STDERR_FILENO)
+        posix_spawn_file_actions_addclose(&actions, readFD)
+        posix_spawn_file_actions_addclose(&actions, writeFD)
+        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+
+        let argvPointers: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { strdup($0) } + [nil]
+        defer { argvPointers.forEach { free($0) } }
+
+        var pid: pid_t = 0
+        let spawned: Int32 = argvPointers.withUnsafeBufferPointer { buffer in
+            posix_spawn(&pid, path, &actions, nil, buffer.baseAddress, environ)
         }
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            box.err = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
+        close(writeFD)
+        guard spawned == 0 else {
+            close(readFD)
+            return (spawned, "")
         }
-        process.waitUntilExit()
-        group.wait()
-        let data = box.out + box.err
+
+        let data = readUntilEOF(readFD, timeoutSeconds: 4)
+        close(readFD)
+
+        var status: Int32 = 0
+        var waited = waitpid(pid, &status, WNOHANG)
+        if waited == 0 {
+            kill(pid, SIGKILL)
+            waited = waitpid(pid, &status, 0)
+        }
+        let code: Int32 = (waited > 0 && (status & 0o177) == 0) ? (status >> 8) & 0xff : -1
         let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-        return (process.terminationStatus, text)
+        return (code, text)
+    }
+
+    private static func readUntilEOF(_ fd: Int32, timeoutSeconds: TimeInterval) -> Data {
+        let flags = fcntl(fd, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            var pollFD = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let remainingMS = Int32(max(1, min(deadline.timeIntervalSinceNow * 1000, 4000)))
+            let ready = poll(&pollFD, 1, remainingMS)
+            if ready == 0 { break }
+            if ready < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                data.append(buffer, count: count)
+                continue
+            }
+            if count == 0 { break }
+            if errno == EINTR || errno == EAGAIN { continue }
+            break
+        }
+        return data
     }
     
     private func applyPowerUILimit(_ requested: Int) -> Bool {
@@ -469,17 +525,23 @@ public class HardwareBackend {
             return false
         }
         
-        // Arm the feature, then overwrite the saved value. setMCLLimit: would
-        // clamp this back to 80, so it must not be called with the real target.
-        if getCurrentPowerUILimit()?.enabled != true {
-            _ = enableMCL()
-            Thread.sleep(forTimeInterval: 0.2)
+        // setMCLLimit: rejects anything under 80 and leaves the previous ceiling
+        // in place. enableMCL: is that same XPC path; calling it on every
+        // republish puts Apple's default back and the pack charges to full.
+        // Arm it once, then always overwrite the saved value.
+        if !didArmMCL {
+            if getCurrentPowerUILimit()?.enabled != true {
+                _ = enableMCL()
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            didArmMCL = true
         }
         guard publishTopOffPreference(limit: clamped, enabled: true) else {
             logger.error("Failed to write mclLimitValue \(clamped, privacy: .public)")
             return false
         }
-        notifyChargeLimitChanged(restartAgent: true)
+        let valueChanged = lastPublishedLimit != clamped
+        notifyChargeLimitChanged(restartAgent: valueChanged)
         lastPublishedLimit = clamped
         lastPublishAt = Date()
         logger.info("Published sub-80 charge ceiling \(clamped, privacy: .public) to powerd")
@@ -516,7 +578,34 @@ public class HardwareBackend {
             put("enabled", kCFBooleanFalse)
             put("mclLimitValue", NSNumber(value: 100))
         }
-        return CFPreferencesSynchronize(domain, user, host)
+        let synced = CFPreferencesSynchronize(domain, user, host)
+        publishConsoleUserTopOff(limit: limit, enabled: enabled)
+        return synced
+    }
+
+    /// PowerUIAgent is sometimes the console user. The daemon's CFPreferences
+    /// write lands in root's domain, so the same keys are written for the
+    /// person at the keyboard too. Specific keys only; the timeline stays.
+    private func publishConsoleUserTopOff(limit: Int, enabled: Bool) {
+        guard let uid = Self.consoleUserID(), uid != 0 else { return }
+        let domain = "com.apple.smartcharging.topoffprotection"
+        func write(_ key: String, _ type: String, _ value: String) {
+            _ = Self.runCommand("/bin/launchctl", [
+                "asuser", String(uid),
+                "/usr/bin/defaults", "write", domain, key, type, value
+            ])
+        }
+        if enabled {
+            write("mclLimitValue", "-int", "\(limit)")
+            write("mclTargetSoC", "-int", "\(limit)")
+            write("MCLSavedTargetSoC", "-int", "\(limit)")
+            write("MCLFeatureState", "-int", "1")
+            write("enabled", "-bool", "true")
+        } else {
+            write("MCLFeatureState", "-int", "0")
+            write("enabled", "-bool", "false")
+            write("mclLimitValue", "-int", "100")
+        }
     }
     
     private func notifyChargeLimitChanged(restartAgent: Bool) {
