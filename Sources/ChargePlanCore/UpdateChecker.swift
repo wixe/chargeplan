@@ -3,8 +3,7 @@ import Foundation
 import AppKit
 #endif
 
-public let ChargePlanVersion = "0.4.6"
-public let ChargeCapVersion = ChargePlanVersion
+public let ChargePlanVersion = "0.4.7"
 
 public struct ReleaseInfo: Codable, Equatable {
     public let version: String
@@ -60,12 +59,28 @@ public enum UpdateError: LocalizedError {
 }
 
 public final class UpdateChecker {
-    private static let repoOwner = "wixe"
-    private static let repoName = "chargeplan"
+    private static let repoOwner = ChargePlanLayout.gitHubOwner
+    private static let repoName = ChargePlanLayout.gitHubRepo
     
     private static let lastCheckKey = "io.github.wixe.chargeplan.lastUpdateCheck"
     private static let cachedReleaseKey = "io.github.wixe.chargeplan.cachedReleaseInfo"
+    private static let legacyCacheKeys = [
+        "com.wixe.chargeplan.cachedReleaseInfo",
+        "com.wixe.chargecap.cachedReleaseInfo",
+    ]
     private static let checkIntervalSeconds: TimeInterval = 86400 // 24 hours
+    
+    /// Newest cached release, including caches written under the old defaults keys.
+    public static func cachedRelease() -> ReleaseInfo? {
+        let defaults = UserDefaults.standard
+        for key in [cachedReleaseKey] + legacyCacheKeys {
+            if let data = defaults.data(forKey: key),
+               let info = try? JSONDecoder().decode(ReleaseInfo.self, from: data) {
+                return info
+            }
+        }
+        return nil
+    }
     
     /// Compares two semver version strings (e.g. "0.2.0" vs "v0.3.0").
     public static func compareVersion(_ v1: String, _ v2: String) -> ComparisonResult {
@@ -94,9 +109,10 @@ public final class UpdateChecker {
         defaults.removeObject(forKey: lastCheckKey)
         defaults.removeObject(forKey: cachedReleaseKey)
         defaults.removeObject(forKey: "com.wixe.chargeplan.lastUpdateCheck")
-        defaults.removeObject(forKey: "com.wixe.chargeplan.cachedReleaseInfo")
         defaults.removeObject(forKey: "com.wixe.chargecap.lastUpdateCheck")
-        defaults.removeObject(forKey: "com.wixe.chargecap.cachedReleaseInfo")
+        for key in legacyCacheKeys {
+            defaults.removeObject(forKey: key)
+        }
     }
     
     /// Queries GitHub for the latest release or tags. Throttled to once every 24 hours unless `force: true`.
@@ -288,8 +304,8 @@ public final class UpdateChecker {
             throw UpdateError.missingAppBundle
         }
         
-        progressHandler("Installing /Applications/ChargePlan.app…")
-        let destApp = URL(fileURLWithPath: "/Applications/ChargePlan.app")
+        progressHandler("Installing \(ChargePlanLayout.appBundle)…")
+        let destApp = URL(fileURLWithPath: ChargePlanLayout.appBundle)
         
         var installedViaDaemon = false
         var installSuccess = false
@@ -325,8 +341,8 @@ public final class UpdateChecker {
         
         // Tier 2: If Tier 1 failed (e.g. root-owned bundle or permission denied), ask the root daemon
         if !installSuccess {
-            progressHandler("Requesting root daemon to install /Applications/ChargePlan.app…")
-            if let resp = UnixSocketClient.send("INSTALL_APP \(sourceApp.path)"), resp.contains("\"success\":true") {
+            progressHandler("Requesting root daemon to install \(ChargePlanLayout.appBundle)…")
+            if let resp = UnixSocketClient.send("INSTALL_APP \(sourceApp.path)"), UnixSocketClient.isSuccess(resp) {
                 installSuccess = true
                 installedViaDaemon = true
             } else {
@@ -338,9 +354,10 @@ public final class UpdateChecker {
         
         // Tier 3: If root daemon was not running or failed, fall back to AppleScript with administrator privileges
         if !installSuccess {
-            progressHandler("Requesting administrator approval to install /Applications/ChargePlan.app…")
+            progressHandler("Requesting administrator approval to install \(ChargePlanLayout.appBundle)…")
+            let app = ChargePlanLayout.appBundle
             let adminScript = """
-            do shell script "rm -rf '/Applications/ChargePlan.app' && cp -R '\(sourceApp.path)' '/Applications/ChargePlan.app' && chown -R $USER:admin '/Applications/ChargePlan.app' && xattr -cr '/Applications/ChargePlan.app' && codesign --force --deep --sign - '/Applications/ChargePlan.app'" with administrator privileges
+            do shell script "rm -rf '\(app)' && cp -R '\(sourceApp.path)' '\(app)' && chown -R $USER:admin '\(app)' && xattr -cr '\(app)' && codesign --force --deep --sign - '\(app)'" with administrator privileges
             """
             var scriptError: NSDictionary?
             #if canImport(AppKit)
@@ -359,9 +376,7 @@ public final class UpdateChecker {
             throw UpdateError.copyFailed(installErrorMsg)
         }
         
-        // Ensure quarantine flags are cleared and ad-hoc signed
-        _ = runProcess("/usr/bin/xattr", ["-cr", destApp.path])
-        _ = runProcess("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", destApp.path])
+        SignedBinary.stripQuarantineAndSign(destApp.path, deep: true)
         
         // Detach volume
         _ = runProcess("/usr/bin/hdiutil", ["detach", mountDir.path, "-quiet"])
@@ -372,26 +387,20 @@ public final class UpdateChecker {
             if FileManager.default.isExecutableFile(atPath: bundledCLI) {
                 progressHandler("Automatically updating background daemon & CLI…")
                 // 1. If daemon is running, trigger seamless zero-password socket UPGRADE
-                if let resp = UnixSocketClient.send("UPGRADE \(bundledCLI)"), resp.contains("\"success\":true") {
+                if let resp = UnixSocketClient.send("UPGRADE \(bundledCLI)"), UnixSocketClient.isSuccess(resp) {
                     progressHandler("Background daemon updated and restarted.")
                 } else if getuid() == 0 {
                     // 2. If running as root (e.g. CLI update), copy directly
-                    let daemonDir = "/Library/Application Support/ChargePlan"
-                    let daemonBin = "\(daemonDir)/ChargePlanDaemon"
-                    let cliBin = "/usr/local/bin/chargeplan"
-                    try? FileManager.default.createDirectory(atPath: daemonDir, withIntermediateDirectories: true)
-                    try? FileManager.default.createDirectory(atPath: "/usr/local/bin", withIntermediateDirectories: true)
-                    _ = runProcess("/usr/bin/install", ["-m", "755", bundledCLI, daemonBin])
-                    _ = runProcess("/usr/bin/install", ["-m", "755", bundledCLI, cliBin])
-                    _ = runProcess("/usr/bin/xattr", ["-cr", daemonBin])
-                    _ = runProcess("/usr/bin/xattr", ["-cr", cliBin])
-                    _ = runProcess("/usr/bin/codesign", ["--force", "--sign", "-", daemonBin])
-                    _ = runProcess("/usr/bin/codesign", ["--force", "--sign", "-", cliBin])
-                    // Clean up legacy daemon and restart new
-                    _ = runProcess("/bin/launchctl", ["bootout", "system/com.wixe.chargeplan.daemon"])
-                    _ = runProcess("/bin/launchctl", ["bootout", "system/com.wixe.chargecap.daemon"])
-                    try? FileManager.default.removeItem(atPath: "/Library/LaunchDaemons/com.wixe.chargeplan.daemon.plist")
-                    _ = runProcess("/bin/launchctl", ["kickstart", "-k", "system/io.github.wixe.chargeplan.daemon"])
+                    try? FileManager.default.createDirectory(atPath: ChargePlanLayout.supportDirectory, withIntermediateDirectories: true)
+                    try? FileManager.default.createDirectory(atPath: ChargePlanLayout.cliDirectory, withIntermediateDirectories: true)
+                    _ = SignedBinary.install(from: bundledCLI, to: ChargePlanLayout.daemonBinary)
+                    _ = SignedBinary.install(from: bundledCLI, to: ChargePlanLayout.cliBinary)
+                    SignedBinary.stripQuarantineAndSign(ChargePlanLayout.daemonBinary)
+                    SignedBinary.stripQuarantineAndSign(ChargePlanLayout.cliBinary)
+                    _ = runProcess("/bin/launchctl", ["bootout", "system/\(ChargePlanLayout.previousDaemonLabel)"])
+                    _ = runProcess("/bin/launchctl", ["bootout", "system/\(ChargePlanLayout.chargeCapDaemonLabel)"])
+                    try? FileManager.default.removeItem(atPath: ChargePlanLayout.legacyDaemonPlists[0])
+                    _ = runProcess("/bin/launchctl", ["kickstart", "-k", "system/\(ChargePlanLayout.daemonLabel)"])
                 }
             }
         }
@@ -401,10 +410,7 @@ public final class UpdateChecker {
         
         if relaunch {
             progressHandler("Relaunching ChargePlan…")
-            let relaunchProc = Process()
-            relaunchProc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            relaunchProc.arguments = ["-n", destApp.path]
-            try? relaunchProc.run()
+            _ = Shell.run("/usr/bin/open", ["-n", destApp.path])
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 exit(0)
@@ -435,29 +441,21 @@ public final class UpdateChecker {
         try data.write(to: tempBin)
         
         progressHandler("Installing ChargePlanDaemon & CLI…")
-        let daemonDir = "/Library/Application Support/ChargePlan"
-        let daemonBin = "\(daemonDir)/ChargePlanDaemon"
-        try? FileManager.default.createDirectory(atPath: daemonDir, withIntermediateDirectories: true)
-        _ = runProcess("/usr/bin/install", ["-m", "755", tempBin.path, daemonBin])
-        _ = runProcess("/usr/bin/xattr", ["-cr", daemonBin])
-        _ = runProcess("/usr/bin/codesign", ["--force", "--sign", "-", daemonBin])
-        
-        // Also install /usr/local/bin/chargeplan
-        let dest = "/usr/local/bin/chargeplan"
-        _ = runProcess("/usr/bin/install", ["-m", "755", tempBin.path, dest])
-        _ = runProcess("/usr/bin/xattr", ["-cr", dest])
-        _ = runProcess("/usr/bin/codesign", ["--force", "--sign", "-", dest])
+        try? FileManager.default.createDirectory(atPath: ChargePlanLayout.supportDirectory, withIntermediateDirectories: true)
+        _ = SignedBinary.install(from: tempBin.path, to: ChargePlanLayout.daemonBinary)
+        SignedBinary.stripQuarantineAndSign(ChargePlanLayout.daemonBinary)
+        _ = SignedBinary.install(from: tempBin.path, to: ChargePlanLayout.cliBinary)
+        SignedBinary.stripQuarantineAndSign(ChargePlanLayout.cliBinary)
         
         progressHandler("Restarting LaunchDaemon…")
-        _ = runProcess("/bin/launchctl", ["bootout", "system/com.wixe.chargeplan.daemon"])
-        _ = runProcess("/bin/launchctl", ["bootout", "system/com.wixe.chargecap.daemon"])
-        try? FileManager.default.removeItem(atPath: "/Library/LaunchDaemons/com.wixe.chargeplan.daemon.plist")
-        try? FileManager.default.removeItem(atPath: "/Library/LaunchDaemons/com.wixe.chargecap.daemon.plist")
+        _ = runProcess("/bin/launchctl", ["bootout", "system/\(ChargePlanLayout.previousDaemonLabel)"])
+        _ = runProcess("/bin/launchctl", ["bootout", "system/\(ChargePlanLayout.chargeCapDaemonLabel)"])
+        try? FileManager.default.removeItem(atPath: ChargePlanLayout.legacyDaemonPlists[0])
+        try? FileManager.default.removeItem(atPath: ChargePlanLayout.legacyDaemonPlists[1])
         
-        let newPlist = "/Library/LaunchDaemons/io.github.wixe.chargeplan.daemon.plist"
-        if FileManager.default.fileExists(atPath: newPlist) {
-            _ = runProcess("/bin/launchctl", ["bootstrap", "system", newPlist])
-            _ = runProcess("/bin/launchctl", ["kickstart", "-k", "system/io.github.wixe.chargeplan.daemon"])
+        if FileManager.default.fileExists(atPath: ChargePlanLayout.daemonPlist) {
+            _ = runProcess("/bin/launchctl", ["bootstrap", "system", ChargePlanLayout.daemonPlist])
+            _ = runProcess("/bin/launchctl", ["kickstart", "-k", "system/\(ChargePlanLayout.daemonLabel)"])
         }
         
         // Clear cached update
@@ -465,20 +463,6 @@ public final class UpdateChecker {
     }
     
     private static func runProcess(_ path: String, _ args: [String]) -> (exitCode: Int32, output: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        do {
-            try p.run()
-            p.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return (p.terminationStatus, output)
-        } catch {
-            return (-1, error.localizedDescription)
-        }
+        Shell.run(path, args)
     }
 }

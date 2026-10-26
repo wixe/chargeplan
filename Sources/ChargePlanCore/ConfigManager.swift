@@ -3,13 +3,13 @@ import Foundation
 public class ConfigManager {
     public static let shared = ConfigManager()
     
-    private let systemConfigPath = "/etc/chargeplan.json"
-    private let legacyConfigPath = "/etc/chargecap.json"
+    private let systemConfigPath = ChargePlanLayout.systemConfigPath
+    private let legacyConfigPath = ChargePlanLayout.legacyConfigPath
     private let userConfigPath: String
     
     public init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        self.userConfigPath = "\(home)/.config/chargeplan/config.json"
+        self.userConfigPath = ChargePlanLayout.userConfigPath(home: home)
     }
     
     private var activePath: String {

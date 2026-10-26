@@ -155,4 +155,78 @@ final class ChargePlanTests: XCTestCase {
         XCTAssertNil(obj?["kickCooldownSeconds"])
         XCTAssertNil(obj?["kickDwellSeconds"])
     }
+    
+    func testSailingConfigKeysStillDecode() throws {
+        let json = """
+        {"targetLimit":70,"sailingEnabled":false,"sailingDelta":2,"thermalProtectionEnabled":true,"autoServerMode":true,"pollIntervalSeconds":5}
+        """.data(using: .utf8)!
+        let cfg = try JSONDecoder().decode(GovernorConfig.self, from: json)
+        XCTAssertEqual(cfg.targetLimit, 70)
+        XCTAssertFalse(cfg.driftEnabled)
+        XCTAssertEqual(cfg.driftMargin, 2)
+    }
+    
+    func testDaemonPlistUsesCurrentLabel() {
+        let xml = ChargePlanLayout.daemonPlistXML(program: ChargePlanLayout.daemonBinary)
+        XCTAssertTrue(xml.contains("<string>\(ChargePlanLayout.daemonLabel)</string>"))
+        XCTAssertTrue(xml.contains("<string>\(ChargePlanLayout.daemonBinary)</string>"))
+        XCTAssertTrue(xml.contains("<key>KeepAlive</key>"))
+        XCTAssertFalse(xml.contains("chargecap"))
+    }
+    
+    func testAppLaunchAgentStaysInBackground() {
+        let xml = ChargePlanLayout.appLaunchAgentXML(executable: "\(ChargePlanLayout.appBundle)/Contents/MacOS/ChargePlanApp")
+        XCTAssertTrue(xml.contains(ChargePlanLayout.appLabel))
+        XCTAssertTrue(xml.contains("--background"))
+    }
+    
+    func testChargeReportShape() {
+        let batt = BatteryStatus(
+            percent: 60,
+            exactPercent: 60.2,
+            isCharging: false,
+            isACConnected: true,
+            isFullyCharged: false,
+            cycleCount: 10,
+            voltageMV: 11000,
+            amperageMA: 0,
+            wattageW: 0,
+            designCapacityMAh: 4000,
+            fullChargeCapacityMAh: 3800,
+            remainingCapacityMAh: 2200,
+            nominalCapacityMAh: 3900,
+            healthPercent: 95,
+            timeRemainingMinutes: 100,
+            serialNumber: "TEST",
+            thermalState: "Nominal"
+        )
+        let report = ChargeReport.dictionary(
+            battery: batt,
+            config: .default,
+            state: .initial,
+            backend: "test",
+            enforcedSoc: 60
+        )
+        let gov = report["governor"] as? [String: Any]
+        XCTAssertEqual(gov?["enforced_soc"] as? Int, 60)
+        XCTAssertEqual(gov?["version"] as? String, ChargePlanVersion)
+        XCTAssertEqual(gov?["deadband_enabled"] as? Bool, true)
+        XCTAssertNil(gov?["kick_count"])
+    }
+    
+    func testShellEcho() {
+        let result = Shell.run("/bin/echo", ["chargeplan"])
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(result.output, "chargeplan\n")
+    }
+    
+    func testSignedBinaryRejectsTinySource() throws {
+        let src = FileManager.default.temporaryDirectory.appendingPathComponent("cp-tiny-\(UUID().uuidString)")
+        try Data("nope".utf8).write(to: src)
+        defer { try? FileManager.default.removeItem(at: src) }
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("cp-dest-\(UUID().uuidString)")
+        XCTAssertFalse(SignedBinary.install(from: src.path, to: dest.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dest.path))
+        XCTAssertEqual(SignedBinary.byteCount(src.path), 4)
+    }
 }

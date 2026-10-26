@@ -1,9 +1,22 @@
 import Foundation
 import Darwin
 
+func writeUnixPath(_ path: String, into addr: inout sockaddr_un) -> Bool {
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = path.utf8CString
+    let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
+    guard pathBytes.count <= maxLen else { return false }
+    return withUnsafeMutableBytes(of: &addr.sun_path) { rawBuf in
+        for (i, byte) in pathBytes.enumerated() {
+            rawBuf[i] = UInt8(bitPattern: byte)
+        }
+        return true
+    }
+}
+
 public final class UnixSocketServer {
-    public static let defaultSocketPath = "/var/run/chargeplan.sock"
-    public static let legacySocketPath = "/var/run/chargecap.sock"
+    public static let defaultSocketPath = ChargePlanLayout.socketPath
+    public static let legacySocketPath = ChargePlanLayout.legacySocketPath
     
     private let socketPath: String
     private var serverFD: Int32 = -1
@@ -29,17 +42,9 @@ public final class UnixSocketServer {
         guard fd >= 0 else { return }
         
         var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = socketPath.utf8CString
-        let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
-        guard pathBytes.count <= maxLen else {
+        guard writeUnixPath(socketPath, into: &addr) else {
             close(fd)
             return
-        }
-        withUnsafeMutableBytes(of: &addr.sun_path) { rawBuf in
-            for (i, byte) in pathBytes.enumerated() {
-                rawBuf[i] = UInt8(bitPattern: byte)
-            }
         }
         
         let bindResult = withUnsafePointer(to: &addr) { ptr in
@@ -186,7 +191,7 @@ public final class UnixSocketServer {
             return "{\"success\":true,\"drift_enabled\":\(enabled),\"drift_margin\":\(margin),\"deadband_enabled\":\(enabled),\"deadband_delta\":\(margin)}\n"
             
         case "UPGRADE":
-            var sourcePath = "/Applications/ChargePlan.app/Contents/Resources/chargeplan"
+            var sourcePath = "\(ChargePlanLayout.appBundle)/Contents/Resources/chargeplan"
             if parts.count >= 2 {
                 sourcePath = parts[1]
             }
@@ -206,64 +211,19 @@ public final class UnixSocketServer {
                 return "{\"error\":\"Source binary is invalid or corrupt\"}\n"
             }
             
-            let daemonDir = "/Library/Application Support/ChargePlan"
-            let daemonBin = "\(daemonDir)/ChargePlanDaemon"
-            let cliBin = "/usr/local/bin/chargeplan"
+            let daemonBin = ChargePlanLayout.daemonBinary
+            let cliBin = ChargePlanLayout.cliBinary
             
-            try? FileManager.default.createDirectory(atPath: daemonDir, withIntermediateDirectories: true)
-            try? FileManager.default.createDirectory(atPath: "/usr/local/bin", withIntermediateDirectories: true)
+            try? FileManager.default.createDirectory(atPath: ChargePlanLayout.supportDirectory, withIntermediateDirectories: true)
+            try? FileManager.default.createDirectory(atPath: ChargePlanLayout.cliDirectory, withIntermediateDirectories: true)
             
-            // /usr/bin/install can leave a busy Mach-O untouched and still exit.
-            // Fall back to copy-and-replace, and do not claim success unless the
-            // destination is the new file.
-            func installedSize(_ path: String) -> Int64? {
-                guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
-                if let size = attrs[.size] as? Int64 { return size }
-                if let size = attrs[.size] as? Int { return Int64(size) }
-                if let size = attrs[.size] as? NSNumber { return size.int64Value }
-                return nil
-            }
-            func installBinary(from source: String, to dest: String) -> Bool {
-                let installer = Process()
-                installer.executableURL = URL(fileURLWithPath: "/usr/bin/install")
-                installer.arguments = ["-m", "755", source, dest]
-                try? installer.run()
-                installer.waitUntilExit()
-                if installer.terminationStatus == 0, installedSize(dest) == fileSize {
-                    return true
-                }
-                let tmp = dest + ".new"
-                do {
-                    if FileManager.default.fileExists(atPath: tmp) {
-                        try FileManager.default.removeItem(atPath: tmp)
-                    }
-                    try FileManager.default.copyItem(atPath: source, toPath: tmp)
-                    if FileManager.default.fileExists(atPath: dest) {
-                        try FileManager.default.removeItem(atPath: dest)
-                    }
-                    try FileManager.default.moveItem(atPath: tmp, toPath: dest)
-                    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest)
-                    return installedSize(dest) == fileSize
-                } catch {
-                    return false
-                }
-            }
-            guard installBinary(from: sourcePath, to: daemonBin), installBinary(from: sourcePath, to: cliBin) else {
+            guard SignedBinary.install(from: sourcePath, to: daemonBin),
+                  SignedBinary.install(from: sourcePath, to: cliBin) else {
                 return "{\"error\":\"Failed to install the new ChargePlan binary\"}\n"
             }
             
             for path in [daemonBin, cliBin] {
-                let xattr = Process()
-                xattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-                xattr.arguments = ["-cr", path]
-                try? xattr.run()
-                xattr.waitUntilExit()
-                
-                let cs = Process()
-                cs.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-                cs.arguments = ["--force", "--sign", "-", path]
-                try? cs.run()
-                cs.waitUntilExit()
+                SignedBinary.stripQuarantineAndSign(path)
             }
             
             // Allow socket response to flush before exit so launchd KeepAlive restarts with new binary
@@ -284,89 +244,43 @@ public final class UnixSocketServer {
             guard FileManager.default.fileExists(atPath: sourceApp) && sourceApp.hasSuffix(".app") else {
                 return "{\"error\":\"Invalid source app path: \(sourceApp)\"}\n"
             }
-            let destApp = "/Applications/ChargePlan.app"
+            let destApp = ChargePlanLayout.appBundle
             let trashOld = "/tmp/ChargePlan-old-\(UUID().uuidString).app"
             
-            // Move aside existing app
             if FileManager.default.fileExists(atPath: destApp) {
-                let mvOld = Process()
-                mvOld.executableURL = URL(fileURLWithPath: "/bin/mv")
-                mvOld.arguments = [destApp, trashOld]
-                try? mvOld.run()
-                mvOld.waitUntilExit()
+                _ = Shell.run("/bin/mv", [destApp, trashOld])
             }
             
-            let cpProc = Process()
-            cpProc.executableURL = URL(fileURLWithPath: "/bin/cp")
-            cpProc.arguments = ["-R", sourceApp, destApp]
-            try? cpProc.run()
-            cpProc.waitUntilExit()
+            let copied = Shell.run("/bin/cp", ["-R", sourceApp, destApp])
+            if copied.exitCode != 0 {
+                if FileManager.default.fileExists(atPath: trashOld) {
+                    _ = Shell.run("/bin/mv", [trashOld, destApp])
+                }
+                let detail = copied.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                return "{\"error\":\"Failed to copy ChargePlan.app\(detail.isEmpty ? "" : ": \(detail)")\"}\n"
+            }
             
             _ = try? FileManager.default.removeItem(atPath: trashOld)
-            _ = try? FileManager.default.removeItem(atPath: "/Applications/ChargeCap.app")
+            _ = try? FileManager.default.removeItem(atPath: ChargePlanLayout.legacyAppBundle)
             
-            // Fix ownership to the active console user so they own the app bundle
-            let whoProc = Process()
-            whoProc.executableURL = URL(fileURLWithPath: "/usr/bin/stat")
-            whoProc.arguments = ["-f", "%Su", "/dev/console"]
-            let whoPipe = Pipe()
-            whoProc.standardOutput = whoPipe
-            try? whoProc.run()
-            whoProc.waitUntilExit()
-            let whoData = whoPipe.fileHandleForReading.readDataToEndOfFile()
-            let consoleUser = String(data: whoData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !consoleUser.isEmpty && consoleUser != "root" {
-                let chownProc = Process()
-                chownProc.executableURL = URL(fileURLWithPath: "/usr/sbin/chown")
-                chownProc.arguments = ["-R", "\(consoleUser):admin", destApp]
-                try? chownProc.run()
-                chownProc.waitUntilExit()
+            let who = Shell.run("/usr/bin/stat", ["-f", "%Su", "/dev/console"])
+            let consoleUser = who.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if who.exitCode == 0, !consoleUser.isEmpty, consoleUser != "root" {
+                _ = Shell.run("/usr/sbin/chown", ["-R", "\(consoleUser):admin", destApp])
             }
             
-            let xattr = Process()
-            xattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-            xattr.arguments = ["-cr", destApp]
-            try? xattr.run()
-            xattr.waitUntilExit()
+            SignedBinary.stripQuarantineAndSign(destApp, deep: true)
             
-            let cs = Process()
-            cs.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-            cs.arguments = ["--force", "--deep", "--sign", "-", destApp]
-            try? cs.run()
-            cs.waitUntilExit()
-            
-            // Also install the bundled CLI and daemon binaries atomically
             let bundledCLI = "\(destApp)/Contents/Resources/chargeplan"
             if FileManager.default.isExecutableFile(atPath: bundledCLI) {
-                let daemonDir = "/Library/Application Support/ChargePlan"
-                let daemonBin = "\(daemonDir)/ChargePlanDaemon"
-                let cliBin = "/usr/local/bin/chargeplan"
-                
-                let p1 = Process()
-                p1.executableURL = URL(fileURLWithPath: "/usr/bin/install")
-                p1.arguments = ["-m", "755", bundledCLI, daemonBin]
-                try? p1.run()
-                p1.waitUntilExit()
-                
-                let p2 = Process()
-                p2.executableURL = URL(fileURLWithPath: "/usr/bin/install")
-                p2.arguments = ["-m", "755", bundledCLI, cliBin]
-                try? p2.run()
-                p2.waitUntilExit()
-                
-                for path in [daemonBin, cliBin] {
-                    let xa = Process()
-                    xa.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-                    xa.arguments = ["-cr", path]
-                    try? xa.run()
-                    xa.waitUntilExit()
-                    
-                    let sgn = Process()
-                    sgn.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-                    sgn.arguments = ["--force", "--sign", "-", path]
-                    try? sgn.run()
-                    sgn.waitUntilExit()
+                try? FileManager.default.createDirectory(atPath: ChargePlanLayout.supportDirectory, withIntermediateDirectories: true)
+                try? FileManager.default.createDirectory(atPath: ChargePlanLayout.cliDirectory, withIntermediateDirectories: true)
+                guard SignedBinary.install(from: bundledCLI, to: ChargePlanLayout.daemonBinary),
+                      SignedBinary.install(from: bundledCLI, to: ChargePlanLayout.cliBinary) else {
+                    return "{\"error\":\"Failed to install the new ChargePlan binary\"}\n"
                 }
+                SignedBinary.stripQuarantineAndSign(ChargePlanLayout.daemonBinary)
+                SignedBinary.stripQuarantineAndSign(ChargePlanLayout.cliBinary)
                 
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
                     exit(0)
@@ -422,16 +336,7 @@ public enum UnixSocketClient {
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, timeoutLen)
         
         var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = socketPath.utf8CString
-        let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
-        guard pathBytes.count <= maxLen else { return nil }
-        
-        withUnsafeMutableBytes(of: &addr.sun_path) { rawBuf in
-            for (i, byte) in pathBytes.enumerated() {
-                rawBuf[i] = UInt8(bitPattern: byte)
-            }
-        }
+        guard writeUnixPath(socketPath, into: &addr) else { return nil }
         
         let connected = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
