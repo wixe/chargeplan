@@ -28,8 +28,6 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     // Update state & controls
     private var latestRelease: ReleaseInfo?
     private var isUpdatingApp: Bool = false
-    /// Ceiling the daemon is enforcing when it sits above the saved setpoint.
-    private var menuHoldLimit: Int?
     private var isAutoSyncingDaemon: Bool = false
     private var menuIsOpen = false
     private var replacingMenu = false
@@ -121,10 +119,8 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let daemonActive = daemonInfo.running
         let govMode = daemonInfo.mode
         let backendName = daemonInfo.backend ?? fallbackHardware.modeName
-        menuHoldLimit = daemonInfo.hold
-        
         let iconPrefix = menuBarSymbol(for: status)
-        applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status, hold: daemonInfo.hold)
+        applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status)
         
         let menu = NSMenu()
         menu.delegate = self
@@ -1023,16 +1019,15 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private func updateMenuBarTitleOnly() {
         let status = monitor.getCurrentStatus()
         let cfg = ConfigManager.shared.load()
-        applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status, hold: menuHoldLimit)
+        applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status)
     }
     
-    /// Orange while a missed setpoint is being held one point above the pack.
-    /// The arrow still shows the saved setpoint.
-    private func applyMenuBarTitle(percent: Int, target: Int, status: BatteryStatus, hold: Int?) {
+    /// Orange while plugged in above the saved setpoint. The arrow still shows that setpoint.
+    private func applyMenuBarTitle(percent: Int, target: Int, status: BatteryStatus) {
         guard let button = statusItem.button else { return }
         let title = "\(menuBarSymbol(for: status)) \(percent)% → \(target)%"
-        let raised = (hold ?? target) > target
-        let color: NSColor = raised ? .systemOrange : .labelColor
+        let aboveSetpoint = status.isACConnected && percent > target
+        let color: NSColor = aboveSetpoint ? .systemOrange : .labelColor
         let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
         button.attributedTitle = NSAttributedString(string: title, attributes: [
             .foregroundColor: color,
