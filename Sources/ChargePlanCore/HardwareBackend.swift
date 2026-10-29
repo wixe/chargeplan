@@ -23,7 +23,7 @@ public class HardwareBackend {
     private var powerUIAvailableLimits: [Int] = []
     private var lastPublishedLimit: Int = -1
     private var lastPublishAt: Date = .distantPast
-    private var powerdCache: (at: Date, value: Int?, explicitNone: Bool)?
+    private var powerdCache: (at: Date, text: String)?
     private let powerdLock = NSLock()
     /// enableMCL: is the 80–100 XPC path. Calling it while a sub-80 ceiling is
     /// installed puts Apple's default back and the pack charges toward full.
@@ -299,37 +299,119 @@ public class HardwareBackend {
     /// While on battery, powerd often reports no policy even when a ceiling is saved.
     /// The reading is cached for two seconds so status and the governor share one `pmset`.
     public func powerdSocLimit() -> Int? {
-        cachedCeiling().value
+        Self.parsePowerdSocLimits(powerdLimitText()).max()
     }
     
     /// True only when `pmset` itself reported that no ceiling is registered.
     /// A failed or empty capture is not that report.
     public func powerdReportedNoCeiling() -> Bool {
-        cachedCeiling().explicitNone
+        let text = powerdLimitText()
+        return Self.parsePowerdSocLimits(text).isEmpty && text.contains("No battery level limits set")
     }
     
-    private func cachedCeiling() -> (value: Int?, explicitNone: Bool) {
+    /// PowerUI's charging screen. 13 is charging toward the manual limit,
+    /// 14–15 are holding it, 16 is discharging down to it, and 18 is the
+    /// calibration charge to 100% that runs before the limit holds.
+    public func powerUIInterfaceState() -> (state: Int, limit: Int)? {
+        guard let cls = powerUIClass, let client = powerUIClient else { return nil }
+        let sel = NSSelectorFromString("smartChargingUIState:chargeLimit:chargingOverrideAllowed:withError:")
+        guard let method = class_getInstanceMethod(cls, sel) else { return nil }
+        typealias Fn = @convention(c) (
+            AnyObject, Selector,
+            UnsafeMutablePointer<UInt64>,
+            UnsafeMutablePointer<UInt64>,
+            UnsafeMutablePointer<ObjCBool>,
+            UnsafeMutablePointer<NSError?>
+        ) -> Bool
+        var state: UInt64 = 0
+        var limit: UInt64 = 0
+        var allow = ObjCBool(false)
+        var err: NSError?
+        let ok = unsafeBitCast(method_getImplementation(method), to: Fn.self)(client, sel, &state, &limit, &allow, &err)
+        guard ok, err == nil, state <= 64, limit <= 100 else { return nil }
+        return (Int(state), Int(limit))
+    }
+    
+    /// A listed percentage is not a stop. powerd inhibits charging only when
+    /// `chargeSocLimitNoChargeToFull` is 1 for that percentage.
+    public func powerdInhibitsFullCharge(at soc: Int) -> Bool {
+        Self.parsePowerdSocLimitRecords(powerdLimitText()).contains {
+            !$0.terminated && $0.soc == soc && $0.noChargeToFull
+        }
+    }
+    
+    private func powerdLimitText() -> String {
         powerdLock.lock()
         if let cache = powerdCache, Date().timeIntervalSince(cache.at) < 2 {
-            let cached = (cache.value, cache.explicitNone)
+            let text = cache.text
             powerdLock.unlock()
-            return cached
+            return text
         }
         powerdLock.unlock()
 
         let text = Self.readPmsetBattlimit()
-        let value = Self.parsePowerdSocLimits(text).max()
-        let explicitNone = value == nil && text.contains("No battery level limits set")
         powerdLock.lock()
-        powerdCache = (Date(), value, explicitNone)
+        powerdCache = (Date(), text)
         powerdLock.unlock()
-        return (value, explicitNone)
+        return text
     }
     
     private func invalidatePowerdCache() {
         powerdLock.lock()
         powerdCache = nil
         powerdLock.unlock()
+    }
+    
+    public struct PowerdSocLimit: Equatable {
+        public let soc: Int
+        public let noChargeToFull: Bool
+        public let terminated: Bool
+    }
+    
+    /// One powerd ceiling. `noChargeToFull` is the bit that actually stops the charger.
+    public static func parsePowerdSocLimitRecords(_ text: String) -> [PowerdSocLimit] {
+        var records: [PowerdSocLimit] = []
+        var depth = 0
+        var bodyStart: String.Index?
+        for index in text.indices {
+            let character = text[index]
+            if character == "{" {
+                if depth == 0 { bodyStart = text.index(after: index) }
+                depth += 1
+            } else if character == "}" && depth > 0 {
+                depth -= 1
+                if depth == 0, let start = bodyStart {
+                    records.append(contentsOf: limitRecord(in: String(text[start..<index])))
+                    bodyStart = nil
+                }
+            }
+        }
+        if records.isEmpty {
+            records.append(contentsOf: limitRecord(in: text))
+        }
+        return records
+    }
+    
+    private static func limitRecord(in body: String) -> [PowerdSocLimit] {
+        guard let soc = firstAssignment(body, key: "chargeSocLimitSoc"), (1...100).contains(soc) else {
+            return []
+        }
+        let noChargeToFull = firstAssignment(body, key: "chargeSocLimitNoChargeToFull") == 1
+        let terminated = firstAssignment(body, key: "Terminated") == 1
+        return [PowerdSocLimit(soc: soc, noChargeToFull: noChargeToFull, terminated: terminated)]
+    }
+    
+    private static func firstAssignment(_ body: String, key: String) -> Int? {
+        guard let regex = try? NSRegularExpression(pattern: #"\b\#(key)\s*=\s*(\d{1,3})"#) else {
+            return nil
+        }
+        let range = NSRange(body.startIndex..., in: body)
+        guard let match = regex.firstMatch(in: body, range: range),
+              match.numberOfRanges > 1,
+              let valueRange = Range(match.range(at: 1), in: body) else {
+            return nil
+        }
+        return Int(body[valueRange])
     }
     
     static func parsePowerdSocLimits(_ text: String) -> [Int] {
@@ -506,11 +588,14 @@ public class HardwareBackend {
             if !powerUIAvailableLimits.isEmpty && !powerUIAvailableLimits.contains(clamped) {
                 logger.info("Charge limit \(clamped, privacy: .public) is between the advertised steps; sending it directly")
             }
-            let ok = setDirectXPCMCLLimit(UInt8(clamped))
-            if ok, geteuid() == 0 {
-                _ = publishTopOffPreference(limit: clamped, enabled: true)
-                notifyChargeLimitChanged(restartAgent: false)
+            // enableMCL once, then setMCLLimit. A topoff preference write after
+            // this call republishes the percentage with NoChargeToFull left off,
+            // and the pack keeps accepting current. The adapter stays connected.
+            if getCurrentPowerUILimit()?.enabled != true {
+                _ = enableMCL()
+                Thread.sleep(forTimeInterval: 0.2)
             }
+            let ok = setDirectXPCMCLLimit(UInt8(clamped))
             if ok {
                 lastPublishedLimit = clamped
                 lastPublishAt = Date()

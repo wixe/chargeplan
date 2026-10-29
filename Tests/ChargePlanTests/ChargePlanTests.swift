@@ -128,6 +128,25 @@ final class ChargePlanTests: XCTestCase {
         XCTAssertEqual(HardwareBackend.parsePowerdSocLimits("No battery level limits set\n"), [])
         let crowded = "chargeSocLimitOwner = 71566; chargeSocLimitSoc = 50; chargeSocLimitDrain = 1;"
         XCTAssertEqual(HardwareBackend.parsePowerdSocLimits(crowded), [50])
+        let live = """
+        (
+                {
+                Terminated = 0;
+                chargeSocLimitNoChargeToFull = 0;
+                chargeSocLimitSoc = 50;
+            },
+                {
+                Terminated = 0;
+                chargeSocLimitNoChargeToFull = 1;
+                chargeSocLimitSoc = 80;
+            }
+        )
+        """
+        let records = HardwareBackend.parsePowerdSocLimitRecords(live)
+        XCTAssertEqual(records.map(\.soc), [50, 80])
+        XCTAssertFalse(records[0].noChargeToFull)
+        XCTAssertTrue(records[1].noChargeToFull)
+        XCTAssertFalse(records[0].terminated)
     }
     
     func testReportOmitsKickFields() {

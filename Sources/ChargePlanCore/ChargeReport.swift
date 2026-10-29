@@ -32,6 +32,7 @@ public enum ChargeReport {
             "governor": [
                 "version": ChargePlanVersion,
                 "target_limit": config.targetLimit,
+                "hold_limit": state.activeTarget,
                 "drift_enabled": config.driftEnabled,
                 "drift_margin": config.driftMargin,
                 "deadband_enabled": config.driftEnabled,

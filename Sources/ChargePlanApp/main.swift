@@ -28,6 +28,8 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     // Update state & controls
     private var latestRelease: ReleaseInfo?
     private var isUpdatingApp: Bool = false
+    /// Ceiling the daemon is enforcing when it sits above the saved setpoint.
+    private var menuHoldLimit: Int?
     private var isAutoSyncingDaemon: Bool = false
     private var menuIsOpen = false
     private var replacingMenu = false
@@ -94,7 +96,7 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         return true
     }
     
-    private func fetchDaemonStatus() -> (running: Bool, mode: String, backend: String?, version: String?) {
+    private func fetchDaemonStatus() -> (running: Bool, mode: String, backend: String?, version: String?, hold: Int?) {
         if let liveJson = UnixSocketClient.send("STATUS"),
            let data = liveJson.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -102,9 +104,10 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
            let mode = gov["mode"] as? String {
             let backend = gov["backend"] as? String
             let version = gov["version"] as? String
-            return (true, mode, backend, version)
+            let hold = gov["hold_limit"] as? Int
+            return (true, mode, backend, version, hold)
         }
-        return (false, "Daemon Not Installed", nil, nil)
+        return (false, "Daemon Not Installed", nil, nil, nil)
     }
     
     private func rebuildMenu() {
@@ -118,9 +121,10 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let daemonActive = daemonInfo.running
         let govMode = daemonInfo.mode
         let backendName = daemonInfo.backend ?? fallbackHardware.modeName
+        menuHoldLimit = daemonInfo.hold
         
         let iconPrefix = menuBarSymbol(for: status)
-        statusItem.button?.title = "\(iconPrefix) \(status.percent)% → \(cfg.targetLimit)%"
+        applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status, hold: daemonInfo.hold)
         
         let menu = NSMenu()
         menu.delegate = self
@@ -1019,8 +1023,21 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private func updateMenuBarTitleOnly() {
         let status = monitor.getCurrentStatus()
         let cfg = ConfigManager.shared.load()
-        let iconPrefix = menuBarSymbol(for: status)
-        statusItem.button?.title = "\(iconPrefix) \(status.percent)% → \(cfg.targetLimit)%"
+        applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status, hold: menuHoldLimit)
+    }
+    
+    /// Orange while a missed setpoint is being held one point above the pack.
+    /// The arrow still shows the saved setpoint.
+    private func applyMenuBarTitle(percent: Int, target: Int, status: BatteryStatus, hold: Int?) {
+        guard let button = statusItem.button else { return }
+        let title = "\(menuBarSymbol(for: status)) \(percent)% → \(target)%"
+        let raised = (hold ?? target) > target
+        let color: NSColor = raised ? .systemOrange : .labelColor
+        let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
+        button.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: color,
+            .font: font
+        ])
     }
     
     @objc private func quitApp() {

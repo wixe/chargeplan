@@ -13,6 +13,11 @@ public class AIGovernor {
     private let queue = DispatchQueue(label: "io.github.wixe.chargeplan.governor", qos: .utility)
     private let stateLock = NSLock()
     private var lastReassertAt = Date.distantPast
+    /// Ceiling published after the configured stop was missed while charging.
+    /// It sits one point above the pack so the stop is reached from below.
+    /// The saved setpoint is left unchanged. Cleared once the pack falls back
+    /// to that setpoint.
+    private var raisedHold: Int?
     
     public init(config: GovernorConfig = ConfigManager.shared.load()) {
         self.monitor = BatteryMonitor()
@@ -28,6 +33,7 @@ public class AIGovernor {
         stateLock.lock()
         self.config = newConfig
         self.state.activeTarget = newConfig.targetLimit
+        self.raisedHold = nil
         stateLock.unlock()
         _ = ConfigManager.shared.save(newConfig)
         _ = hardware.setChargeLimitPercentage(newConfig.targetLimit, delta: newConfig.driftEnabled ? newConfig.driftMargin : 1, force: true)
@@ -67,6 +73,7 @@ public class AIGovernor {
         if diskConfig != self.config {
             self.config = diskConfig
             self.state.activeTarget = diskConfig.targetLimit
+            self.raisedHold = nil
             _ = hardware.setChargeLimitPercentage(diskConfig.targetLimit, delta: diskConfig.driftEnabled ? diskConfig.driftMargin : 1, force: true)
             lastReassertAt = Date()
         }
@@ -95,7 +102,7 @@ public class AIGovernor {
         let lowerBound = max(20, target - (config.driftEnabled ? config.driftMargin : 1))
         
         if hardware.modeName.contains("Native PowerUI") {
-            publishNativeCeilingIfNeeded(target: target, status: status)
+            publishNativeCeilingIfNeeded(target: target, lowerBound: lowerBound, status: status)
             describeNativeMode(target: target, lowerBound: lowerBound, status: status)
             return
         }
@@ -138,38 +145,98 @@ public class AIGovernor {
         }
     }
     
-    /// Republish when powerd is advertising a different ceiling, or when the
-    /// pack is charging above the hold anyway. A matching ceiling is left
-    /// alone, including while the pack discharges down to it. An unreadable
-    /// pmset capture is not proof the ceiling is gone.
-    private func publishNativeCeilingIfNeeded(target: Int, status: BatteryStatus) {
+    /// One point above the pack, and never 100. A ceiling of 100 clears the limit.
+    private func catchLevel(percent: Int) -> Int {
+        min(99, percent + 1)
+    }
+    
+    /// Publish `ceiling` when powerd is advertising something else, or when
+    /// current is still flowing at or above that ceiling. A charge that is
+    /// still climbing toward the ceiling is left alone.
+    private func publishCeiling(_ ceiling: Int, status: BatteryStatus, immediate: Bool) {
         let enforced = hardware.powerdSocLimit()
-        let lowerBound = max(20, target - (config.driftEnabled ? config.driftMargin : 1))
-        let chargingAboveHold = status.amperageMA > 50 && status.percent > lowerBound
-        if enforced == target && !chargingAboveHold {
-            state.isChargingInhibited = target < 100
+        let chargingPastCeiling = status.amperageMA > 50 && status.percent >= ceiling
+        if enforced == ceiling && !chargingPastCeiling {
+            state.isChargingInhibited = ceiling < 100 && status.amperageMA <= 50
             return
         }
-        if enforced == nil && !hardware.powerdReportedNoCeiling() && !chargingAboveHold {
+        if !immediate && enforced == nil && !hardware.powerdReportedNoCeiling() && !chargingPastCeiling {
             return
         }
         let now = Date()
-        guard now.timeIntervalSince(lastReassertAt) >= Self.ceilingReassertInterval else { return }
+        if !immediate && now.timeIntervalSince(lastReassertAt) < Self.ceilingReassertInterval {
+            return
+        }
         lastReassertAt = now
         let delta = config.driftEnabled ? config.driftMargin : 1
-        let success = hardware.setChargeLimitPercentage(target, delta: delta)
-        state.isChargingInhibited = success && target < 100
+        let success = hardware.setChargeLimitPercentage(ceiling, delta: delta, force: immediate)
+        state.isChargingInhibited = success && ceiling < 100 && !chargingPastCeiling
         state.lastActionTimestamp = now
         let enforcedText = enforced.map { "\($0)%" } ?? "none"
         state.lastActionReason = success
-            ? "Published SoC ceiling at \(target)% (powerd was \(enforcedText), battery \(status.percent)%)"
-            : "Failed to publish SoC ceiling at \(target)% (powerd was \(enforcedText))"
+            ? "Published SoC ceiling at \(ceiling)% (powerd was \(enforcedText), battery \(status.percent)%)"
+            : "Failed to publish SoC ceiling at \(ceiling)% (powerd was \(enforcedText))"
         if !success { state.consecutiveErrors += 1 }
+    }
+    
+    /// A charge that has already passed the setpoint will not stop if the
+    /// ceiling stays below the pack. Raise it to one point above the current
+    /// level so the stop is reached from below, and keep that raised ceiling
+    /// until the pack falls back to the saved setpoint.
+    private func publishNativeCeilingIfNeeded(target: Int, lowerBound: Int, status: BatteryStatus) {
+        let charging = status.isCharging || status.amperageMA > 50
+        if status.percent <= target {
+            raisedHold = nil
+            state.activeTarget = target
+            publishCeiling(target, status: status, immediate: false)
+            return
+        }
+        if charging {
+            let reached = catchLevel(percent: status.percent)
+            if let current = raisedHold, reached > current {
+                raisedHold = reached
+            } else if raisedHold == nil {
+                raisedHold = reached
+            }
+            let hold = raisedHold ?? reached
+            state.activeTarget = hold
+            publishCeiling(hold, status: status, immediate: hardware.powerdSocLimit() != hold)
+            return
+        }
+        if var hold = raisedHold {
+            let margin = config.driftEnabled ? config.driftMargin : 1
+            if status.percent <= hold - margin {
+                hold = min(hold, catchLevel(percent: status.percent))
+                raisedHold = hold
+            }
+            state.activeTarget = hold
+            publishCeiling(hold, status: status, immediate: hardware.powerdSocLimit() != hold)
+            return
+        }
+        state.activeTarget = target
+        let chargingAboveHold = status.amperageMA > 50 && status.percent > lowerBound
+        if hardware.powerdSocLimit() == target && !chargingAboveHold {
+            state.isChargingInhibited = target < 100
+            return
+        }
+        publishCeiling(target, status: status, immediate: false)
     }
     
     private func describeNativeMode(target: Int, lowerBound: Int, status: BatteryStatus) {
         let enforced = hardware.powerdSocLimit()
         let drawingCharge = status.isCharging || status.amperageMA > 50
+        if let hold = raisedHold, hold > target {
+            state.inDrift = true
+            state.activeTarget = hold
+            if drawingCharge && status.percent < hold {
+                state.modeDescription = "Missed \(target)%. Charging to \(hold)% from below (battery \(status.percent)%, \(status.amperageMA)mA)"
+            } else if drawingCharge {
+                state.modeDescription = "Missed \(target)%. Stopping at the \(hold)% catch (battery \(status.percent)%, \(status.amperageMA)mA)"
+            } else {
+                state.modeDescription = "Missed \(target)%. Holding the \(hold)% catch (battery \(status.percent)%)"
+            }
+            return
+        }
         if status.percent >= target {
             state.inDrift = true
             if drawingCharge {
