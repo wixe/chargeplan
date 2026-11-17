@@ -3,21 +3,21 @@ import Darwin
 import ObjectiveC
 import OSLog
 
-public enum ChargingMode: Equatable {
+public enum ChargingMode: Equatable, Sendable {
     case directSMC
     case nativePowerUI
     case auxiliaryCLI(path: String)
     case simulation
 }
 
-public class HardwareBackend {
+public final class HardwareBackend {
     private var smcDriver: SMCDriver?
     private var activeMode: ChargingMode = .simulation
     private var currentLimit: Int = 50
     private var currentDelta: Int = 3
     private let logger = Logger(subsystem: "io.github.wixe.chargeplan", category: "HardwareBackend")
-    
-    // Cached PowerUISmartChargeClient instance
+
+    // Cached PowerUISmartChargeClient instance (allocated once per backend lifetime)
     private var powerUIClient: AnyObject?
     private var powerUIClass: NSObject.Type?
     private var powerUIAvailableLimits: [Int] = []
@@ -25,57 +25,94 @@ public class HardwareBackend {
     private var lastPublishAt: Date = .distantPast
     private var powerdCache: (at: Date, text: String)?
     private let powerdLock = NSLock()
+    private let backendLock = NSRecursiveLock()
     /// enableMCL: is the 80–100 XPC path. Calling it while a sub-80 ceiling is
     /// installed puts Apple's default back and the pack charges toward full.
     private var didArmMCL = false
-    
+
     public init() {
         self.smcDriver = SMCDriver()
         self.setupPowerUI()
         self.activeMode = detectBestMode()
     }
-    
+
+    deinit {
+        smcDriver?.close()
+    }
+
+    public var isNativePowerUI: Bool {
+        activeMode == .nativePowerUI
+    }
+
     private func setupPowerUI() {
-        guard dlopen("/System/Library/PrivateFrameworks/PowerUI.framework/PowerUI", RTLD_NOW) != nil,
-              let cls = NSClassFromString("PowerUISmartChargeClient") as? NSObject.Type else {
-            return
-        }
-        let allocSel = NSSelectorFromString("alloc")
-        let initSel = NSSelectorFromString("initWithClientName:")
-        guard cls.responds(to: allocSel) else { return }
-        let rawObj = cls.perform(allocSel).takeUnretainedValue()
-        guard rawObj.responds(to: initSel) else { return }
-        let client = rawObj.perform(initSel, with: "chargeplan").takeUnretainedValue()
-        
-        let suppSel = NSSelectorFromString("isMCLSupported")
-        let setSel = NSSelectorFromString("setMCLLimit:error:")
-        let disSel = NSSelectorFromString("disableMCL:")
-        let availSel = NSSelectorFromString("availableChargeLimitsWithError:")
-        guard client.responds(to: suppSel),
-              client.responds(to: setSel),
-              client.responds(to: disSel),
-              client.responds(to: availSel),
-              let suppMethod = class_getInstanceMethod(cls, suppSel) else {
-            return
-        }
-        
-        typealias BoolFn = @convention(c) (AnyObject, Selector) -> Bool
-        let isSupported = unsafeBitCast(method_getImplementation(suppMethod), to: BoolFn.self)(client, suppSel)
-        guard isSupported else { return }
-        
-        self.powerUIClass = cls
-        self.powerUIClient = client
-        self.powerUIAvailableLimits = [80, 85, 90, 95, 100]
-        
-        if geteuid() == 0, let availMethod = class_getInstanceMethod(cls, availSel) {
-            typealias AvailFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>) -> AnyObject?
-            var err: NSError? = nil
-            if let arr = unsafeBitCast(method_getImplementation(availMethod), to: AvailFn.self)(client, availSel, &err) as? [NSNumber], !arr.isEmpty {
-                self.powerUIAvailableLimits = arr.map { $0.intValue }.sorted()
+        guard powerUIClient == nil else { return }
+        autoreleasepool {
+            guard dlopen("/System/Library/PrivateFrameworks/PowerUI.framework/PowerUI", RTLD_NOW) != nil,
+                  let cls = NSClassFromString("PowerUISmartChargeClient") as? NSObject.Type else {
+                return
+            }
+            let allocSel = NSSelectorFromString("alloc")
+            let initSel = NSSelectorFromString("initWithClientName:")
+            let suppSel = NSSelectorFromString("isMCLSupported")
+            let setSel = NSSelectorFromString("setMCLLimit:error:")
+            let disSel = NSSelectorFromString("disableMCL:")
+            let availSel = NSSelectorFromString("availableChargeLimitsWithError:")
+
+            guard cls.responds(to: allocSel),
+                  cls.instancesRespond(to: initSel),
+                  cls.instancesRespond(to: suppSel),
+                  cls.instancesRespond(to: setSel),
+                  cls.instancesRespond(to: disSel),
+                  cls.instancesRespond(to: availSel),
+                  let allocMethod = class_getClassMethod(cls, allocSel),
+                  let initMethod = class_getInstanceMethod(cls, initSel),
+                  let suppMethod = class_getInstanceMethod(cls, suppSel) else {
+                return
+            }
+
+            // `+alloc` returns +1; `-initWithClientName:` consumes `self` (+1) and returns +1.
+            // Using direct C IMPs avoids calling `objc_retain` on an uninitialized `+alloc` instance.
+            typealias AllocFn = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>?
+            typealias InitFn = @convention(c) (UnsafeMutableRawPointer, Selector, NSString) -> Unmanaged<AnyObject>?
+            guard let rawAllocated = unsafeBitCast(method_getImplementation(allocMethod), to: AllocFn.self)(cls, allocSel) else {
+                return
+            }
+            guard let initialized = unsafeBitCast(method_getImplementation(initMethod), to: InitFn.self)(
+                rawAllocated.toOpaque(),
+                initSel,
+                "chargeplan" as NSString
+            ) else {
+                return
+            }
+            let client = initialized.takeRetainedValue()
+
+            typealias BoolFn = @convention(c) (AnyObject, Selector) -> Bool
+            let isSupported = unsafeBitCast(method_getImplementation(suppMethod), to: BoolFn.self)(client, suppSel)
+            guard isSupported else { return }
+
+            self.powerUIClass = cls
+            self.powerUIClient = client
+            self.powerUIAvailableLimits = [80, 85, 90, 95, 100]
+
+            if geteuid() == 0, let availMethod = class_getInstanceMethod(cls, availSel) {
+                // ObjC `NSError **` is `__autoreleasing` (+0); use `Unmanaged<NSError>?` so Swift ARC
+                // never emits an extra `objc_release` when the surrounding `autoreleasepool` drains.
+                typealias AvailFn = @convention(c) (
+                    AnyObject,
+                    Selector,
+                    UnsafeMutablePointer<Unmanaged<NSError>?>?
+                ) -> Unmanaged<AnyObject>?
+                var err: Unmanaged<NSError>? = nil
+                if let rawArr = unsafeBitCast(method_getImplementation(availMethod), to: AvailFn.self)(client, availSel, &err),
+                   err == nil,
+                   let arr = rawArr.takeUnretainedValue() as? [NSNumber],
+                   !arr.isEmpty {
+                    self.powerUIAvailableLimits = arr.map { $0.intValue }.sorted()
+                }
             }
         }
     }
-    
+
     private func hasDirectSMCChargingKeys(_ smc: SMCDriver) -> Bool {
         if smc.getKeyInfo("bfF0") != nil && smc.getKeyInfo("bfD0") != nil && smc.getKeyInfo("bfE0") != nil {
             return true
@@ -91,19 +128,14 @@ public class HardwareBackend {
         }
         return false
     }
-    
+
     private func detectBestMode() -> ChargingMode {
-        // 1. Direct AppleSMC charge-inhibit keys (True AC Pass-Through for 20-100%)
         if let smc = smcDriver, hasDirectSMCChargingKeys(smc) {
             return .directSMC
         }
-        
-        // 2. macOS Native PowerUISmartChargeClient (True AC Pass-Through on gated macOS 27+ firmware)
         if powerUIClient != nil {
             return .nativePowerUI
         }
-        
-        // 3. Fallback to auxiliary CLI if installed
         let possibleCLIs = [
             "/usr/local/bin/smc",
             "/opt/homebrew/bin/smc",
@@ -115,10 +147,9 @@ public class HardwareBackend {
                 return .auxiliaryCLI(path: path)
             }
         }
-        
         return .simulation
     }
-    
+
     public var modeName: String {
         switch activeMode {
         case .directSMC:
@@ -131,139 +162,124 @@ public class HardwareBackend {
             return "Simulation (Driver Emulation)"
         }
     }
-    
+
     public func setChargingInhibited(_ inhibit: Bool) -> Bool {
-        switch activeMode {
-        case .directSMC:
-            guard let smc = smcDriver else { return false }
-            
-            // 1. Firmware-managed hysteresis keys (bfF0 / bfD0 / bfE0)
-            if smc.getKeyInfo("bfF0") != nil && smc.getKeyInfo("bfD0") != nil && smc.getKeyInfo("bfE0") != nil {
-                if inhibit {
-                    let upper = UInt32(max(30, min(100, currentLimit)))
-                    let lower = UInt32(max(25, Int(upper) - max(1, currentDelta)))
+        backendLock.lock()
+        defer { backendLock.unlock() }
+        return autoreleasepool {
+            switch activeMode {
+            case .directSMC:
+                guard let smc = smcDriver else { return false }
+
+                if smc.getKeyInfo("bfF0") != nil && smc.getKeyInfo("bfD0") != nil && smc.getKeyInfo("bfE0") != nil {
+                    if inhibit {
+                        let upper = UInt32(max(30, min(100, currentLimit)))
+                        let lower = UInt32(max(25, Int(upper) - max(1, currentDelta)))
+                        _ = smc.writeByte("bfF0", value: 0x00)
+                        let sUpper = smc.writeUInt32LE("bfD0", value: upper)
+                        let sLower = smc.writeUInt32LE("bfE0", value: lower)
+                        let sAct = smc.writeByte("bfF0", value: 0x02)
+                        return sUpper && sLower && sAct
+                    } else {
+                        return smc.writeByte("bfF0", value: 0x00)
+                    }
+                }
+
+                if smc.getKeyInfo("CHTE") != nil {
+                    let bytes: [UInt8] = inhibit ? [0x01, 0x00, 0x00, 0x00] : [0x00, 0x00, 0x00, 0x00]
+                    return smc.writeBytes("CHTE", bytes: bytes)
+                }
+
+                if smc.getKeyInfo("CH0B") != nil {
+                    let val: UInt8 = inhibit ? 0x02 : 0x00
+                    let s1 = smc.writeByte("CH0B", value: val)
+                    if smc.getKeyInfo("CH0C") != nil {
+                        _ = smc.writeByte("CH0C", value: val)
+                    }
+                    return s1
+                }
+
+                return false
+
+            case .nativePowerUI:
+                return inhibit ? applyPowerUILimit(currentLimit, force: false) : disablePowerUILimit()
+
+            case .auxiliaryCLI(let path):
+                let args: [String]
+                if path.contains("batt") {
+                    args = inhibit ? ["limit", "\(max(30, min(100, currentLimit)))"] : ["disable"]
+                } else {
+                    args = ["-k", "CH0B", "-w", inhibit ? "02" : "00"]
+                }
+                return Self.runCommand(path, args).status == 0
+
+            case .simulation:
+                return true
+            }
+        }
+    }
+
+    public func setChargeLimitPercentage(_ limit: Int, delta: Int = 3, force: Bool = false) -> Bool {
+        backendLock.lock()
+        defer { backendLock.unlock() }
+        let clamped = max(30, min(100, limit))
+        self.currentLimit = clamped
+        self.currentDelta = max(1, delta)
+
+        return autoreleasepool {
+            switch activeMode {
+            case .directSMC:
+                guard let smc = smcDriver else { return false }
+                if smc.getKeyInfo("bfF0") != nil && smc.getKeyInfo("bfD0") != nil && smc.getKeyInfo("bfE0") != nil {
+                    if clamped >= 100 {
+                        return smc.writeByte("bfF0", value: 0x00)
+                    }
+                    let upper = UInt32(clamped)
+                    let lower = UInt32(max(25, clamped - self.currentDelta))
                     _ = smc.writeByte("bfF0", value: 0x00)
                     let sUpper = smc.writeUInt32LE("bfD0", value: upper)
                     let sLower = smc.writeUInt32LE("bfE0", value: lower)
                     let sAct = smc.writeByte("bfF0", value: 0x02)
                     return sUpper && sLower && sAct
-                } else {
-                    return smc.writeByte("bfF0", value: 0x00)
                 }
-            }
-            
-            // 2. Modern Apple Silicon 4-byte charge inhibit key (CHTE)
-            if smc.getKeyInfo("CHTE") != nil {
-                let bytes: [UInt8] = inhibit ? [0x01, 0x00, 0x00, 0x00] : [0x00, 0x00, 0x00, 0x00]
-                return smc.writeBytes("CHTE", bytes: bytes)
-            }
-            
-            // 3. Legacy Apple Silicon 1-byte charge inhibit keys (CH0B & CH0C)
-            if smc.getKeyInfo("CH0B") != nil {
-                let val: UInt8 = inhibit ? 0x02 : 0x00
-                let s1 = smc.writeByte("CH0B", value: val)
-                if smc.getKeyInfo("CH0C") != nil {
-                    _ = smc.writeByte("CH0C", value: val)
+                if smc.getKeyInfo("BCLM") != nil {
+                    return smc.writeByte("BCLM", value: UInt8(clamped))
                 }
-                return s1
-            }
-            
-            return false
-            
-        case .nativePowerUI:
-            if inhibit {
-                return applyPowerUILimit(currentLimit)
-            } else {
-                return disablePowerUILimit()
-            }
-            
-        case .auxiliaryCLI(let path):
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: path)
-            if path.contains("batt") {
-                // Never use `batt adapter disable` (which cuts AC wall power and drains the battery).
-                // Use `batt limit` / `batt disable` for AC pass-through charge limiting.
-                process.arguments = inhibit ? ["limit", "\(max(30, min(100, currentLimit)))"] : ["disable"]
-            } else {
-                // smc -k CH0B -w <val>
-                process.arguments = ["-k", "CH0B", "-w", inhibit ? "02" : "00"]
-            }
-            
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-            
-            do {
-                try process.run()
-                process.waitUntilExit()
-                return process.terminationStatus == 0
-            } catch {
-                return false
-            }
-            
-        case .simulation:
-            return true
-        }
-    }
-    
-    public func setChargeLimitPercentage(_ limit: Int, delta: Int = 3, force: Bool = false) -> Bool {
-        let clamped = max(30, min(100, limit))
-        self.currentLimit = clamped
-        self.currentDelta = max(1, delta)
-        if force {
-            lastPublishedLimit = -1
-        }
-        
-        switch activeMode {
-        case .directSMC:
-            guard let smc = smcDriver else { return false }
-            if smc.getKeyInfo("bfF0") != nil && smc.getKeyInfo("bfD0") != nil && smc.getKeyInfo("bfE0") != nil {
+                return true
+
+            case .nativePowerUI:
                 if clamped >= 100 {
-                    return smc.writeByte("bfF0", value: 0x00)
+                    return disablePowerUILimit()
                 }
-                let upper = UInt32(clamped)
-                let lower = UInt32(max(25, clamped - self.currentDelta))
-                _ = smc.writeByte("bfF0", value: 0x00)
-                let sUpper = smc.writeUInt32LE("bfD0", value: upper)
-                let sLower = smc.writeUInt32LE("bfE0", value: lower)
-                let sAct = smc.writeByte("bfF0", value: 0x02)
-                return sUpper && sLower && sAct
-            }
-            if smc.getKeyInfo("BCLM") != nil {
-                return smc.writeByte("BCLM", value: UInt8(clamped))
-            }
-            // CHTE / CH0B are toggled dynamically by AIGovernor
-            return true
-            
-        case .nativePowerUI:
-            if clamped >= 100 {
-                return disablePowerUILimit()
-            }
-            return applyPowerUILimit(clamped)
-            
-        case .auxiliaryCLI(let path):
-            if path.contains("batt") {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: path)
-                process.arguments = clamped >= 100 ? ["disable"] : ["limit", "\(clamped)"]
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                    return process.terminationStatus == 0
-                } catch {
-                    return false
+                return applyPowerUILimit(clamped, force: force)
+
+            case .auxiliaryCLI(let path):
+                if path.contains("batt") {
+                    let args = clamped >= 100 ? ["disable"] : ["limit", "\(clamped)"]
+                    return Self.runCommand(path, args).status == 0
                 }
+                return true
+
+            case .simulation:
+                return true
             }
-            return true
-            
-        case .simulation:
-            return true
         }
     }
-    
+
+    /// Safely invokes an Objective-C method taking `(NSError * __autoreleasing *)` inside any `autoreleasepool`
+    /// without allowing Swift ARC to treat the `+0` autoreleased out-parameter as `+1` `__strong`.
+    internal static func invokeObjCBoolWithAutoreleasingError(
+        client: AnyObject,
+        cls: AnyClass,
+        selector: Selector
+    ) -> (ok: Bool, hadError: Bool)? {
+        guard let method = class_getInstanceMethod(cls, selector) else { return nil }
+        typealias Fn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<Unmanaged<NSError>?>?) -> Bool
+        var err: Unmanaged<NSError>? = nil
+        let ok = unsafeBitCast(method_getImplementation(method), to: Fn.self)(client, selector, &err)
+        return (ok, err != nil)
+    }
+
     private func getCurrentPowerUILimit() -> (enabled: Bool, limit: Int)? {
         guard let cls = powerUIClass, let client = powerUIClient else { return nil }
         let getSel = NSSelectorFromString("getMCLLimitWithError:")
@@ -274,10 +290,10 @@ public class HardwareBackend {
               let enMethod = class_getInstanceMethod(cls, enSel) else {
             return nil
         }
-        typealias GetLimitFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>) -> UInt8
-        typealias IsEnabledFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>) -> UInt64
-        var err1: NSError? = nil
-        var err2: NSError? = nil
+        typealias GetLimitFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<Unmanaged<NSError>?>?) -> UInt8
+        typealias IsEnabledFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<Unmanaged<NSError>?>?) -> UInt64
+        var err1: Unmanaged<NSError>? = nil
+        var err2: Unmanaged<NSError>? = nil
         let limit = unsafeBitCast(method_getImplementation(getMethod), to: GetLimitFn.self)(client, getSel, &err1)
         let enabled = unsafeBitCast(method_getImplementation(enMethod), to: IsEnabledFn.self)(client, enSel, &err2)
         if err1 != nil || err2 != nil {
@@ -285,33 +301,47 @@ public class HardwareBackend {
         }
         return (enabled != 0, Int(limit))
     }
-    
+
     private func setDirectXPCMCLLimit(_ target: UInt8) -> Bool {
         guard let cls = powerUIClass, let client = powerUIClient else { return false }
         let setSel = NSSelectorFromString("setMCLLimit:error:")
         guard let method = class_getInstanceMethod(cls, setSel) else { return false }
-        typealias SetFn = @convention(c) (AnyObject, Selector, UInt8, UnsafeMutablePointer<NSError?>) -> Bool
-        var err: NSError? = nil
+        typealias SetFn = @convention(c) (AnyObject, Selector, UInt8, UnsafeMutablePointer<Unmanaged<NSError>?>?) -> Bool
+        var err: Unmanaged<NSError>? = nil
         return unsafeBitCast(method_getImplementation(method), to: SetFn.self)(client, setSel, target, &err)
     }
-    
-    /// Highest `chargeSocLimitSoc` currently registered with powerd, if any.
-    /// While on battery, powerd often reports no policy even when a ceiling is saved.
-    /// The reading is cached for two seconds so status and the governor share one `pmset`.
+
+    /// Snapshot of powerd's active non-terminated SoC ceiling and explicit-none flag.
+    public func powerdSnapshot() -> PowerdSnapshot {
+        let text = powerdLimitText()
+        let activeLimits = Self.parsePowerdSocLimits(text)
+        let enforced = activeLimits.max()
+        let explicitNone: Bool
+        if !activeLimits.isEmpty {
+            explicitNone = false
+        } else {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                explicitNone = false
+            } else {
+                let allRecords = Self.parsePowerdSocLimitRecords(text)
+                explicitNone = (!allRecords.isEmpty && allRecords.allSatisfy(\.terminated))
+                    || text.contains("No battery level limits set")
+            }
+        }
+        return PowerdSnapshot(enforcedSoc: enforced, reportedNoCeiling: explicitNone)
+    }
+
+    /// Highest active (non-terminated) `chargeSocLimitSoc` registered with powerd, if any.
     public func powerdSocLimit() -> Int? {
         Self.parsePowerdSocLimits(powerdLimitText()).max()
     }
-    
-    /// True only when `pmset` itself reported that no ceiling is registered.
-    /// A failed or empty capture is not that report.
+
+    /// True only when `pmset` itself reported that no active ceiling is registered.
     public func powerdReportedNoCeiling() -> Bool {
-        let text = powerdLimitText()
-        return Self.parsePowerdSocLimits(text).isEmpty && text.contains("No battery level limits set")
+        powerdSnapshot().reportedNoCeiling
     }
-    
-    /// PowerUI's charging screen. 13 is charging toward the manual limit,
-    /// 14–15 are holding it, 16 is discharging down to it, and 18 is the
-    /// calibration charge to 100% that runs before the limit holds.
+
     public func powerUIInterfaceState() -> (state: Int, limit: Int)? {
         guard let cls = powerUIClass, let client = powerUIClient else { return nil }
         let sel = NSSelectorFromString("smartChargingUIState:chargeLimit:chargingOverrideAllowed:withError:")
@@ -321,54 +351,54 @@ public class HardwareBackend {
             UnsafeMutablePointer<UInt64>,
             UnsafeMutablePointer<UInt64>,
             UnsafeMutablePointer<ObjCBool>,
-            UnsafeMutablePointer<NSError?>
+            UnsafeMutablePointer<Unmanaged<NSError>?>?
         ) -> Bool
         var state: UInt64 = 0
         var limit: UInt64 = 0
         var allow = ObjCBool(false)
-        var err: NSError?
+        var err: Unmanaged<NSError>? = nil
         let ok = unsafeBitCast(method_getImplementation(method), to: Fn.self)(client, sel, &state, &limit, &allow, &err)
         guard ok, err == nil, state <= 64, limit <= 100 else { return nil }
         return (Int(state), Int(limit))
     }
-    
-    /// A listed percentage is not a stop. powerd inhibits charging only when
-    /// `chargeSocLimitNoChargeToFull` is 1 for that percentage.
+
     public func powerdInhibitsFullCharge(at soc: Int) -> Bool {
         Self.parsePowerdSocLimitRecords(powerdLimitText()).contains {
             !$0.terminated && $0.soc == soc && $0.noChargeToFull
         }
     }
-    
+
     private func powerdLimitText() -> String {
         powerdLock.lock()
-        if let cache = powerdCache, Date().timeIntervalSince(cache.at) < 2 {
+        if let cache = powerdCache, Date().timeIntervalSince(cache.at) < 2.5 {
             let text = cache.text
             powerdLock.unlock()
             return text
         }
         powerdLock.unlock()
 
-        let text = Self.readPmsetBattlimit()
+        let text = autoreleasepool {
+            Self.readPmsetBattlimit()
+        }
         powerdLock.lock()
         powerdCache = (Date(), text)
         powerdLock.unlock()
         return text
     }
-    
+
     private func invalidatePowerdCache() {
         powerdLock.lock()
         powerdCache = nil
         powerdLock.unlock()
     }
-    
-    public struct PowerdSocLimit: Equatable {
+
+    public struct PowerdSocLimit: Equatable, Sendable {
         public let soc: Int
         public let noChargeToFull: Bool
         public let terminated: Bool
     }
-    
-    /// One powerd ceiling. `noChargeToFull` is the bit that actually stops the charger.
+
+    /// Pure zero-regex parser for `pmset -g battlimit` records.
     public static func parsePowerdSocLimitRecords(_ text: String) -> [PowerdSocLimit] {
         var records: [PowerdSocLimit] = []
         var depth = 0
@@ -381,59 +411,95 @@ public class HardwareBackend {
             } else if character == "}" && depth > 0 {
                 depth -= 1
                 if depth == 0, let start = bodyStart {
-                    records.append(contentsOf: limitRecord(in: String(text[start..<index])))
+                    records.append(contentsOf: limitRecord(in: text[start..<index]))
                     bodyStart = nil
                 }
             }
         }
         if records.isEmpty {
-            records.append(contentsOf: limitRecord(in: text))
+            records.append(contentsOf: limitRecord(in: text[...]))
         }
         return records
     }
-    
-    private static func limitRecord(in body: String) -> [PowerdSocLimit] {
-        guard let soc = firstAssignment(body, key: "chargeSocLimitSoc"), (1...100).contains(soc) else {
+
+    /// Active (non-terminated) SoC limits advertised by powerd.
+    /// Filtering out `Terminated = 1` entries prevents stale Optimized Battery Charging
+    /// records (e.g. 80%) from masking an active sub-80 manual ceiling.
+    public static func parsePowerdSocLimits(_ text: String) -> [Int] {
+        parsePowerdSocLimitRecords(text)
+            .filter { !$0.terminated }
+            .map(\.soc)
+    }
+
+    private static func limitRecord(in body: Substring) -> [PowerdSocLimit] {
+        guard let soc = firstIntAssignment(in: body, key: "chargeSocLimitSoc"), (1...100).contains(soc) else {
             return []
         }
-        let noChargeToFull = firstAssignment(body, key: "chargeSocLimitNoChargeToFull") == 1
-        let terminated = firstAssignment(body, key: "Terminated") == 1
+        let noChargeToFull = firstIntAssignment(in: body, key: "chargeSocLimitNoChargeToFull") == 1
+        let terminated = firstIntAssignment(in: body, key: "Terminated") == 1
         return [PowerdSocLimit(soc: soc, noChargeToFull: noChargeToFull, terminated: terminated)]
     }
-    
-    private static func firstAssignment(_ body: String, key: String) -> Int? {
-        guard let regex = try? NSRegularExpression(pattern: #"\b\#(key)\s*=\s*(\d{1,3})"#) else {
+
+    /// Pure UTF-8 byte scanner for `<word-boundary><key>\s*=\s*(\d{1,3})\b` with zero regex or heap allocations.
+    private static func firstIntAssignment(in body: Substring, key: StaticString) -> Int? {
+        let utf8 = body.utf8
+        let keyCount = key.utf8CodeUnitCount
+        guard utf8.count > keyCount else { return nil }
+
+        @inline(__always)
+        func isIdent(_ b: UInt8) -> Bool {
+            (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F
+        }
+        @inline(__always)
+        func isSpace(_ b: UInt8) -> Bool {
+            b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D
+        }
+
+        return key.withUTF8Buffer { keyBuf in
+            var idx = utf8.startIndex
+            var prevByte: UInt8? = nil
+
+            while idx < utf8.endIndex {
+                let b = utf8[idx]
+                if b == keyBuf[0], (prevByte == nil || !isIdent(prevByte!)) {
+                    var scan = idx
+                    var matchedKey = true
+                    for k in 0..<keyCount {
+                        guard scan < utf8.endIndex, utf8[scan] == keyBuf[k] else {
+                            matchedKey = false
+                            break
+                        }
+                        scan = utf8.index(after: scan)
+                    }
+                    if matchedKey, (scan == utf8.endIndex || !isIdent(utf8[scan])) {
+                        while scan < utf8.endIndex && isSpace(utf8[scan]) {
+                            scan = utf8.index(after: scan)
+                        }
+                        if scan < utf8.endIndex && utf8[scan] == 0x3D { // '='
+                            scan = utf8.index(after: scan)
+                            while scan < utf8.endIndex && isSpace(utf8[scan]) {
+                                scan = utf8.index(after: scan)
+                            }
+                            var value = 0
+                            var digits = 0
+                            while scan < utf8.endIndex, utf8[scan] >= 0x30, utf8[scan] <= 0x39, digits < 4 {
+                                value = value * 10 + Int(utf8[scan] - 0x30)
+                                digits += 1
+                                scan = utf8.index(after: scan)
+                            }
+                            if (1...3).contains(digits) {
+                                return value
+                            }
+                        }
+                    }
+                }
+                prevByte = b
+                idx = utf8.index(after: idx)
+            }
             return nil
         }
-        let range = NSRange(body.startIndex..., in: body)
-        guard let match = regex.firstMatch(in: body, range: range),
-              match.numberOfRanges > 1,
-              let valueRange = Range(match.range(at: 1), in: body) else {
-            return nil
-        }
-        return Int(body[valueRange])
     }
-    
-    static func parsePowerdSocLimits(_ text: String) -> [Int] {
-        guard let regex = try? NSRegularExpression(pattern: #"chargeSocLimitSoc\s*=\s*(\d{1,3})"#) else {
-            return []
-        }
-        let range = NSRange(text.startIndex..., in: text)
-        var values: [Int] = []
-        regex.enumerateMatches(in: text, range: range) { match, _, _ in
-            guard let match, match.numberOfRanges > 1,
-                  let valueRange = Range(match.range(at: 1), in: text),
-                  let value = Int(text[valueRange]),
-                  (1...100).contains(value) else { return }
-            values.append(value)
-        }
-        return values
-    }
-    
-    /// powerd's registered ceilings. An empty capture is not "No battery level
-    /// limits set": launchd often cannot see the session's policy, so a miss
-    /// is tried again as the console user. The text that actually contains a
-    /// ceiling wins.
+
     private static func readPmsetBattlimit() -> String {
         let direct = runCommand("/usr/bin/pmset", ["-g", "battlimit"])
         if !parsePowerdSocLimits(direct.output).isEmpty {
@@ -452,21 +518,22 @@ public class HardwareBackend {
     }
 
     private static func longerBattlimitText(_ first: String, _ second: String) -> String {
-        if second.count > first.count { return second }
-        return first
+        second.count > first.count ? second : first
     }
-    
+
     private static let battlimitLogLock = NSLock()
     private static var lastBattlimitLog = ""
     private static var lastBattlimitLogAt = Date.distantPast
-    
-    /// Log when neither read shows a ceiling. Repeated identical misses are
-    /// collapsed so a LaunchDaemon does not fill the log every poll.
+
     private static func logBattlimitRead(
         direct: (status: Int32, output: String),
         bounced: (status: Int32, output: String)?,
         uid: uid_t?
     ) {
+        // Do not spam logs when powerd explicitly reports "No battery level limits set" (e.g. on battery or 100% cap)
+        if direct.output.contains("No battery level limits set") || bounced?.output.contains("No battery level limits set") == true {
+            return
+        }
         func flat(_ text: String) -> String {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { return "empty" }
@@ -486,7 +553,7 @@ public class HardwareBackend {
         fputs(line, stdout)
         fflush(stdout)
     }
-    
+
     private static func consoleUserID() -> uid_t? {
         var info = stat()
         guard stat("/dev/console", &info) == 0 else { return nil }
@@ -494,16 +561,15 @@ public class HardwareBackend {
         guard uid != 0 else { return nil }
         return uid
     }
-    
-    /// posix_spawn plus a timed read. Swift's Process pipes come back empty
-    /// under a LaunchDaemon, and an empty capture must not be treated as
-    /// "no ceiling".
+
     @discardableResult
     private static func runCommand(_ path: String, _ args: [String]) -> (status: Int32, output: String) {
         var pipes = [Int32](repeating: -1, count: 2)
         guard pipe(&pipes) == 0 else { return (-1, "") }
         let readFD = pipes[0]
         let writeFD = pipes[1]
+        _ = fcntl(readFD, F_SETFD, FD_CLOEXEC)
+        _ = fcntl(writeFD, F_SETFD, FD_CLOEXEC)
 
         var actions: posix_spawn_file_actions_t?
         guard posix_spawn_file_actions_init(&actions) == 0 else {
@@ -518,12 +584,26 @@ public class HardwareBackend {
         posix_spawn_file_actions_addclose(&actions, writeFD)
         posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
 
+        var spawnAttr: posix_spawnattr_t?
+        let hasAttr = (posix_spawnattr_init(&spawnAttr) == 0)
+        if hasAttr {
+            posix_spawnattr_setflags(&spawnAttr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT))
+        }
+        defer {
+            if hasAttr {
+                posix_spawnattr_destroy(&spawnAttr)
+            }
+        }
+
         let argvPointers: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { strdup($0) } + [nil]
         defer { argvPointers.forEach { free($0) } }
 
         var pid: pid_t = 0
         let spawned: Int32 = argvPointers.withUnsafeBufferPointer { buffer in
-            posix_spawn(&pid, path, &actions, nil, buffer.baseAddress, environ)
+            if hasAttr {
+                return posix_spawn(&pid, path, &actions, &spawnAttr, buffer.baseAddress, environ)
+            }
+            return posix_spawn(&pid, path, &actions, nil, buffer.baseAddress, environ)
         }
         close(writeFD)
         guard spawned == 0 else {
@@ -537,8 +617,16 @@ public class HardwareBackend {
         var status: Int32 = 0
         var waited = waitpid(pid, &status, WNOHANG)
         if waited == 0 {
-            kill(pid, SIGKILL)
-            waited = waitpid(pid, &status, 0)
+            // Give fast-exiting child up to 50ms to reap cleanly before SIGKILL
+            for _ in 0..<10 {
+                usleep(5_000)
+                waited = waitpid(pid, &status, WNOHANG)
+                if waited != 0 { break }
+            }
+            if waited == 0 {
+                kill(pid, SIGKILL)
+                waited = waitpid(pid, &status, 0)
+            }
         }
         let code: Int32 = (waited > 0 && (status & 0o177) == 0) ? (status >> 8) & 0xff : -1
         let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
@@ -573,24 +661,18 @@ public class HardwareBackend {
         }
         return data
     }
-    
-    private func applyPowerUILimit(_ requested: Int) -> Bool {
+
+    private func applyPowerUILimit(_ requested: Int, force: Bool) -> Bool {
         let clamped = max(20, min(100, requested))
-        if clamped == lastPublishedLimit, Date().timeIntervalSince(lastPublishAt) < 15 {
+        if !force, clamped == lastPublishedLimit, Date().timeIntervalSince(lastPublishAt) < 15 {
             return true
         }
         invalidatePowerdCache()
-        
-        // 80–100 is accepted by setMCLLimit:. Below 80 the XPC handler returns
-        // PowerUISmartChargingErrorDomain error 4 and leaves the previous ceiling
-        // (usually 80) in place, so the battery keeps charging toward that floor.
+
         if clamped >= 80 {
             if !powerUIAvailableLimits.isEmpty && !powerUIAvailableLimits.contains(clamped) {
                 logger.info("Charge limit \(clamped, privacy: .public) is between the advertised steps; sending it directly")
             }
-            // enableMCL once, then setMCLLimit. A topoff preference write after
-            // this call republishes the percentage with NoChargeToFull left off,
-            // and the pack keeps accepting current. The adapter stays connected.
             if getCurrentPowerUILimit()?.enabled != true {
                 _ = enableMCL()
                 Thread.sleep(forTimeInterval: 0.2)
@@ -604,16 +686,12 @@ public class HardwareBackend {
             }
             return ok
         }
-        
+
         guard geteuid() == 0 else {
             logger.error("A charge limit below 80% has to be published by the root daemon")
             return false
         }
-        
-        // setMCLLimit: rejects anything under 80 and leaves the previous ceiling
-        // in place. enableMCL: is that same XPC path; calling it on every
-        // republish puts Apple's default back and the pack charges to full.
-        // Arm it once, then always overwrite the saved value.
+
         if !didArmMCL {
             if getCurrentPowerUILimit()?.enabled != true {
                 _ = enableMCL()
@@ -632,18 +710,13 @@ public class HardwareBackend {
         logger.info("Published sub-80 charge ceiling \(clamped, privacy: .public) to powerd")
         return true
     }
-    
+
     private func enableMCL() -> Bool {
         guard let cls = powerUIClass, let client = powerUIClient else { return false }
         let sel = NSSelectorFromString("enableMCL:")
-        guard let method = class_getInstanceMethod(cls, sel) else { return false }
-        typealias EnFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>) -> Bool
-        var err: NSError? = nil
-        return unsafeBitCast(method_getImplementation(method), to: EnFn.self)(client, sel, &err)
+        return Self.invokeObjCBoolWithAutoreleasingError(client: client, cls: cls, selector: sel)?.ok ?? false
     }
-    
-    /// PowerUIAgent (root) reloads this domain on `com.apple.smartcharging.defaultschanged`
-    /// and forwards `mclLimitValue` to powerd without the 80–100 XPC check.
+
     private func publishTopOffPreference(limit: Int, enabled: Bool) -> Bool {
         let domain = "com.apple.smartcharging.topoffprotection" as CFString
         let user = kCFPreferencesCurrentUser
@@ -668,9 +741,6 @@ public class HardwareBackend {
         return synced
     }
 
-    /// PowerUIAgent is sometimes the console user. The daemon's CFPreferences
-    /// write lands in root's domain, so the same keys are written for the
-    /// person at the keyboard too. Specific keys only; the timeline stays.
     private func publishConsoleUserTopOff(limit: Int, enabled: Bool) {
         guard let uid = Self.consoleUserID(), uid != 0 else { return }
         let domain = "com.apple.smartcharging.topoffprotection"
@@ -692,28 +762,27 @@ public class HardwareBackend {
             write("mclLimitValue", "-int", "100")
         }
     }
-    
+
     private func notifyChargeLimitChanged(restartAgent: Bool) {
         _ = Self.runCommand("/usr/bin/notifyutil", ["-p", "com.apple.smartcharging.defaultschanged"])
-        
+
         guard restartAgent, geteuid() == 0 else { return }
-        // PowerUIAgent reloads the preference on SIGHUP. launchd keeps it running.
+        // PowerUIAgent reloads preferences in-place on SIGHUP; existing XPC client remains valid.
         _ = Self.runCommand("/usr/bin/killall", ["-HUP", "PowerUIAgent"])
-        Thread.sleep(forTimeInterval: 0.4)
-        setupPowerUI()
+        Thread.sleep(forTimeInterval: 0.25)
         invalidatePowerdCache()
     }
-    
+
     private func disablePowerUILimit() -> Bool {
         if let current = getCurrentPowerUILimit(), !current.enabled {
             return true
         }
         guard let cls = powerUIClass, let client = powerUIClient else { return false }
         let disSel = NSSelectorFromString("disableMCL:")
-        guard let method = class_getInstanceMethod(cls, disSel) else { return false }
-        typealias DisFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>) -> Bool
-        var err: NSError? = nil
-        let res = unsafeBitCast(method_getImplementation(method), to: DisFn.self)(client, disSel, &err)
+        guard let invoked = Self.invokeObjCBoolWithAutoreleasingError(client: client, cls: cls, selector: disSel) else {
+            return false
+        }
+        let res = invoked.ok
         if res, geteuid() == 0 {
             _ = publishTopOffPreference(limit: 100, enabled: false)
             notifyChargeLimitChanged(restartAgent: false)

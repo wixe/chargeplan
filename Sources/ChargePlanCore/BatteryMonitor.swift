@@ -2,17 +2,122 @@ import Foundation
 import IOKit
 import IOKit.ps
 
-public class BatteryMonitor {
-    public init() {}
-    
-    public func getCurrentStatus() -> BatteryStatus {
+public final class BatteryMonitor {
+    private let lock = NSLock()
+    private var cachedStatus: (at: Date, status: BatteryStatus)?
+    private var smartBatteryService: io_service_t = IO_OBJECT_NULL
+    private var bankServices: [io_service_t] = []
+    private var packServices: [io_service_t] = []
+    private var didQueryExtendedServices = false
+
+    public init() {
+        self.smartBatteryService = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("AppleSmartBattery")
+        )
+    }
+
+    deinit {
+        if smartBatteryService != IO_OBJECT_NULL {
+            IOObjectRelease(smartBatteryService)
+            smartBatteryService = IO_OBJECT_NULL
+        }
+        for svc in bankServices where svc != IO_OBJECT_NULL {
+            IOObjectRelease(svc)
+        }
+        bankServices.removeAll()
+        for svc in packServices where svc != IO_OBJECT_NULL {
+            IOObjectRelease(svc)
+        }
+        packServices.removeAll()
+    }
+
+    public func getCurrentStatus(maxAge: TimeInterval = 0.8) -> BatteryStatus {
+        let now = Date()
+        if maxAge > 0 {
+            lock.lock()
+            if let cached = cachedStatus, now.timeIntervalSince(cached.at) < maxAge {
+                let status = cached.status
+                lock.unlock()
+                return status
+            }
+            lock.unlock()
+        }
+
+        let fresh = autoreleasepool {
+            readHardwareStatus(timestamp: now)
+        }
+
+        lock.lock()
+        cachedStatus = (now, fresh)
+        lock.unlock()
+        return fresh
+    }
+
+    private func ensureSmartBatteryService() -> io_service_t {
+        lock.lock()
+        defer { lock.unlock() }
+        if smartBatteryService == IO_OBJECT_NULL {
+            smartBatteryService = IOServiceGetMatchingService(
+                kIOMainPortDefault,
+                IOServiceMatching("AppleSmartBattery")
+            )
+        }
+        return smartBatteryService
+    }
+
+    private static func collectServices(matching className: String) -> [io_service_t] {
+        var iter: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(className), &iter) == kIOReturnSuccess else {
+            return []
+        }
+        defer { IOObjectRelease(iter) }
+        var services: [io_service_t] = []
+        var svc = IOIteratorNext(iter)
+        while svc != 0 {
+            services.append(svc)
+            svc = IOIteratorNext(iter)
+        }
+        return services
+    }
+
+    private func ensureExtendedBatteryServices() -> (banks: [io_service_t], packs: [io_service_t]) {
+        lock.lock()
+        if didQueryExtendedServices {
+            let banks = bankServices
+            let packs = packServices
+            lock.unlock()
+            return (banks, packs)
+        }
+        lock.unlock()
+
+        let banks = Self.collectServices(matching: "AppleSmartBatteryBank")
+        let packs = Self.collectServices(matching: "AppleSmartBatteryPack")
+
+        lock.lock()
+        if didQueryExtendedServices {
+            let existingBanks = bankServices
+            let existingPacks = packServices
+            lock.unlock()
+            banks.forEach { IOObjectRelease($0) }
+            packs.forEach { IOObjectRelease($0) }
+            return (existingBanks, existingPacks)
+        }
+        didQueryExtendedServices = true
+        bankServices = banks
+        packServices = packs
+        lock.unlock()
+        return (banks, packs)
+    }
+
+    private func readHardwareStatus(timestamp: Date) -> BatteryStatus {
         var percent = 0
         var isCharging = false
         var isACConnected = false
         var isFullyCharged = false
         var timeRemaining = -1
         var serialNumber = "Unknown"
-        
+
         // 1. Read IOPS (I/O Power Source)
         if let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
            let sources = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as [CFTypeRef]? {
@@ -41,8 +146,8 @@ public class BatteryMonitor {
                 }
             }
         }
-        
-        // 2. Read AppleSmartBattery from IOKit Registry
+
+        // 2. Read AppleSmartBattery from IOKit Registry using cached service port
         var cycleCount = 0
         var voltageMV = 0
         var amperageMA = 0
@@ -52,32 +157,32 @@ public class BatteryMonitor {
         var nominalCapacity = 0
         var wattage = 0.0
         var notChargingReason = 0
-        
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
-        if service != 0 {
+
+        let service = ensureSmartBatteryService()
+        if service != IO_OBJECT_NULL {
             var props: Unmanaged<CFMutableDictionary>?
             if IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
                let dict = props?.takeRetainedValue() as? [String: Any] {
-                
+
                 cycleCount = dict["CycleCount"] as? Int ?? 0
                 voltageMV = dict["Voltage"] as? Int ?? 0
-                
+
                 if let amp = dict["Amperage"] as? Int {
                     amperageMA = amp
                 } else if let instAmp = dict["InstantAmperage"] as? Int {
                     amperageMA = instAmp
                 }
-                
+
                 if let extConn = dict["ExternalConnected"] as? Bool {
                     isACConnected = extConn
                 } else if let extInt = dict["ExternalConnected"] as? Int {
                     isACConnected = (extInt != 0)
                 }
-                
+
                 if let fullyCharged = dict["FullyCharged"] as? Bool {
                     isFullyCharged = fullyCharged
                 }
-                
+
                 if let bdata = dict["BatteryData"] as? [String: Any] {
                     designCapacity = bdata["DesignCapacity"] as? Int ?? 0
                     fullCapacity = bdata["FullChargeCapacity"] as? Int ?? 0
@@ -87,40 +192,37 @@ public class BatteryMonitor {
                         percent = cap
                     }
                 }
-                
+
                 if remainingCapacity == 0, let cur = dict["CurrentCapacity"] as? Int, cur > 100 {
                     remainingCapacity = cur
                 }
-                
+
                 if let cdata = dict["ChargerData"] as? [String: Any] {
                     if let chg = cdata["IsCharging"] as? Int {
                         isCharging = (chg != 0)
                     }
                 }
-                
+
                 if let reason = dict["NotChargingReason"] as? Int {
                     notChargingReason = reason
                 }
-                
+
                 if let s = dict["Serial"] as? String, serialNumber == "Unknown" {
                     serialNumber = s
                 }
             }
-            IOObjectRelease(service)
         }
-        
+
         if voltageMV > 0 && amperageMA != 0 {
-            // V * A / 1,000,000 = Watts
             wattage = Double(voltageMV) * Double(amperageMA) / 1_000_000.0
         }
-        
+
         var health = 100.0
         if designCapacity > 0 && fullCapacity > 0 {
-            health = (Double(fullCapacity) / Double(designCapacity)) * 100.0
-            if health > 100.0 { health = 100.0 }
+            health = min(100.0, (Double(fullCapacity) / Double(designCapacity)) * 100.0)
         }
-        
-        var exactPercent = Double(percent)
+
+        let exactPercent: Double
         if percent >= 100 {
             exactPercent = 100.0
         } else if percent > 0 && fullCapacity > 0 && remainingCapacity > 0 {
@@ -129,55 +231,44 @@ public class BatteryMonitor {
             let clampedFraction = max(0.0, min(0.99, fraction))
             let roundedFraction = min(0.99, (clampedFraction * 100.0).rounded() / 100.0)
             exactPercent = Double(percent) + roundedFraction
+        } else {
+            exactPercent = Double(percent)
         }
-        
-        let tState = ProcessInfo.processInfo.thermalState
+
         let thermalString: String
-        switch tState {
+        switch ProcessInfo.processInfo.thermalState {
         case .nominal: thermalString = "Nominal"
         case .fair: thermalString = "Fair"
         case .serious: thermalString = "Serious (Throttled)"
         case .critical: thermalString = "Critical"
         @unknown default: thermalString = "Unknown"
         }
-        
-        // 3. Read Individual Cell Voltages and Internal Battery Temperature
+
+        // 3. Read Individual Cell Voltages and Internal Battery Temperature using cached service ports
+        let extended = ensureExtendedBatteryServices()
         var cellVoltages: [Int] = []
-        var bankIter: io_iterator_t = 0
-        if IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleSmartBatteryBank"), &bankIter) == kIOReturnSuccess {
-            var bankService = IOIteratorNext(bankIter)
-            while bankService != 0 {
-                var bankProps: Unmanaged<CFMutableDictionary>?
-                if IORegistryEntryCreateCFProperties(bankService, &bankProps, kCFAllocatorDefault, 0) == kIOReturnSuccess,
-                   let dict = bankProps?.takeRetainedValue() as? [String: Any],
-                   let bdata = dict["BatteryData"] as? [String: Any],
-                   let cellV = bdata["CellVoltage"] as? Int {
-                    cellVoltages.append(cellV)
-                }
-                IOObjectRelease(bankService)
-                bankService = IOIteratorNext(bankIter)
+        cellVoltages.reserveCapacity(extended.banks.count)
+        for bankService in extended.banks {
+            var bankProps: Unmanaged<CFMutableDictionary>?
+            if IORegistryEntryCreateCFProperties(bankService, &bankProps, kCFAllocatorDefault, 0) == kIOReturnSuccess,
+               let dict = bankProps?.takeRetainedValue() as? [String: Any],
+               let bdata = dict["BatteryData"] as? [String: Any],
+               let cellV = bdata["CellVoltage"] as? Int {
+                cellVoltages.append(cellV)
             }
-            IOObjectRelease(bankIter)
         }
-        
+
         var tempC: Double? = nil
-        var packIter: io_iterator_t = 0
-        if IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleSmartBatteryPack"), &packIter) == kIOReturnSuccess {
-            var packService = IOIteratorNext(packIter)
-            while packService != 0 {
-                var packProps: Unmanaged<CFMutableDictionary>?
-                if IORegistryEntryCreateCFProperties(packService, &packProps, kCFAllocatorDefault, 0) == kIOReturnSuccess,
-                   let dict = packProps?.takeRetainedValue() as? [String: Any],
-                   let bdata = dict["BatteryData"] as? [String: Any],
-                   let tempRaw = bdata["Temperature"] as? Int {
-                    tempC = Double(tempRaw) / 100.0
-                }
-                IOObjectRelease(packService)
-                packService = IOIteratorNext(packIter)
+        for packService in extended.packs {
+            var packProps: Unmanaged<CFMutableDictionary>?
+            if IORegistryEntryCreateCFProperties(packService, &packProps, kCFAllocatorDefault, 0) == kIOReturnSuccess,
+               let dict = packProps?.takeRetainedValue() as? [String: Any],
+               let bdata = dict["BatteryData"] as? [String: Any],
+               let tempRaw = bdata["Temperature"] as? Int {
+                tempC = Double(tempRaw) / 100.0
             }
-            IOObjectRelease(packIter)
         }
-        
+
         return BatteryStatus(
             percent: percent,
             exactPercent: exactPercent,
@@ -198,7 +289,8 @@ public class BatteryMonitor {
             thermalState: thermalString,
             temperatureC: tempC,
             cellVoltagesMV: cellVoltages,
-            notChargingReason: notChargingReason
+            notChargingReason: notChargingReason,
+            timestamp: timestamp
         )
     }
 }

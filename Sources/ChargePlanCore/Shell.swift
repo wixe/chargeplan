@@ -6,20 +6,26 @@ public enum Shell {
     /// empty Swift Process pipe, and an empty capture must not mean "no ceiling".
     @discardableResult
     public static func run(_ path: String, _ args: [String]) -> (exitCode: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return (process.terminationStatus, output)
-        } catch {
-            return (-1, error.localizedDescription)
+        autoreleasepool {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = args
+            let pipe = Pipe()
+            let readHandle = pipe.fileHandleForReading
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+                // Drain pipe BEFORE waitUntilExit to prevent >64KB pipe buffer deadlock.
+                let data = readHandle.readDataToEndOfFile()
+                try? readHandle.close()
+                process.waitUntilExit()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                return (process.terminationStatus, output)
+            } catch {
+                try? readHandle.close()
+                return (-1, error.localizedDescription)
+            }
         }
     }
 }

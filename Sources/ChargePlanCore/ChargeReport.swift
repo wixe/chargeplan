@@ -1,8 +1,25 @@
 import Foundation
+import Darwin
 
 /// JSON shape shared by the daemon STATUS command and an offline status read.
 /// Building this does not publish a charge ceiling.
 public enum ChargeReport {
+    /// Zero-allocation thread-safe UTC ISO-8601 formatter (`YYYY-MM-DDTHH:MM:SSZ`).
+    public static func formatISO8601(_ date: Date) -> String {
+        var secs = time_t(date.timeIntervalSince1970)
+        var tmVal = tm()
+        gmtime_r(&secs, &tmVal)
+        return String(
+            format: "%04d-%02d-%02dT%02d:%02d:%02dZ",
+            Int(tmVal.tm_year) + 1900,
+            Int(tmVal.tm_mon) + 1,
+            Int(tmVal.tm_mday),
+            Int(tmVal.tm_hour),
+            Int(tmVal.tm_min),
+            Int(tmVal.tm_sec)
+        )
+    }
+
     public static func dictionary(
         battery batt: BatteryStatus,
         config: GovernorConfig,
@@ -43,7 +60,7 @@ public enum ChargeReport {
                 "mode": state.modeDescription,
                 "backend": backend,
                 "last_action": state.lastActionReason,
-                "last_action_time": ISO8601DateFormatter().string(from: state.lastActionTimestamp)
+                "last_action_time": formatISO8601(state.lastActionTimestamp)
             ]
         ]
     }

@@ -248,4 +248,177 @@ final class ChargePlanTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: dest.path))
         XCTAssertEqual(SignedBinary.byteCount(src.path), 4)
     }
+
+    func testPowerdSocParsingFiltersTerminatedRecordsAndBounds() {
+        let samoSample = """
+        Battery level limits:
+        (
+            {
+                Terminated = 0;
+                chargeSocLimitDrain = 1;
+                chargeSocLimitIsEOC = 1;
+                chargeSocLimitNoChargeToFull = 0;
+                chargeSocLimitOwner = 69998;
+                chargeSocLimitReason = manualChargeLimit;
+                chargeSocLimitSoc = 77;
+            },
+            {
+                Terminated = 1;
+                chargeSocLimitDrain = 1;
+                chargeSocLimitIsEOC = 0;
+                chargeSocLimitNoChargeToFull = 0;
+                chargeSocLimitOwner = 663;
+                chargeSocLimitReason = optimizedBatteryCharging;
+                chargeSocLimitSoc = 80;
+            },
+            {
+                Terminated = 0;
+                chargeSocLimitDrain = 1;
+                chargeSocLimitIsEOC = 1;
+                chargeSocLimitNoChargeToFull = 0;
+                chargeSocLimitOwner = 0;
+                chargeSocLimitReason = manualChargeLimit;
+                chargeSocLimitSoc = 77;
+            }
+        )
+        """
+        let allRecords = HardwareBackend.parsePowerdSocLimitRecords(samoSample)
+        XCTAssertEqual(allRecords.map(\.soc), [77, 80, 77])
+        XCTAssertEqual(allRecords.map(\.terminated), [false, true, false])
+        XCTAssertEqual(HardwareBackend.parsePowerdSocLimits(samoSample), [77, 77])
+        XCTAssertEqual(HardwareBackend.parsePowerdSocLimits(samoSample).max(), 77)
+
+        let allTerminated = "{ Terminated = 1; chargeSocLimitSoc = 80; }"
+        XCTAssertEqual(HardwareBackend.parsePowerdSocLimits(allTerminated), [])
+        XCTAssertEqual(HardwareBackend.parsePowerdSocLimits(""), [])
+        XCTAssertEqual(HardwareBackend.parsePowerdSocLimits("{ chargeSocLimitSoc = 0; }"), [])
+        XCTAssertEqual(HardwareBackend.parsePowerdSocLimits("{ chargeSocLimitSoc = 101; }"), [])
+        XCTAssertEqual(HardwareBackend.parsePowerdSocLimits("{ chargeSocLimitSoc = 1000; }"), [])
+    }
+
+    func testFunctionalGovernorPolicyTransitions() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let cfg = GovernorConfig(
+            targetLimit: 50,
+            driftEnabled: true,
+            driftMargin: 3,
+            thermalProtectionEnabled: true,
+            autoServerMode: true,
+            pollIntervalSeconds: 5.0
+        )
+
+        func makeBattery(
+            percent: Int,
+            isCharging: Bool = false,
+            isAC: Bool = true,
+            amperage: Int = 0,
+            thermal: String = "Nominal"
+        ) -> BatteryStatus {
+            BatteryStatus(
+                percent: percent,
+                exactPercent: Double(percent),
+                isCharging: isCharging,
+                isACConnected: isAC,
+                isFullyCharged: percent >= 100,
+                cycleCount: 50,
+                voltageMV: 12000,
+                amperageMA: amperage,
+                wattageW: Double(amperage) * 12.0 / 1000.0,
+                designCapacityMAh: 4382,
+                fullChargeCapacityMAh: 4000,
+                remainingCapacityMAh: percent * 40,
+                nominalCapacityMAh: 4100,
+                healthPercent: 91.3,
+                timeRemainingMinutes: -1,
+                serialNumber: "TEST-SN",
+                thermalState: thermal,
+                timestamp: now
+            )
+        }
+
+        // 1. Steady-state hold on Native PowerUI when enforced == 77 (above 50% target) emits zero writes
+        let mem77 = CeilingMemory(lowWater: 77, chargeCatch: nil, lastRequestedCeiling: 77, lastReassertAt: now.addingTimeInterval(-120))
+        let holdStep = GovernorPolicy.evaluate(
+            config: cfg,
+            diskConfig: cfg,
+            state: .initial,
+            memory: mem77,
+            battery: makeBattery(percent: 77),
+            powerd: PowerdSnapshot(enforcedSoc: 77, reportedNoCeiling: false),
+            usesNativePowerUI: true,
+            now: now
+        )
+        XCTAssertEqual(holdStep.effects, [])
+        XCTAssertEqual(holdStep.state.activeTarget, 77)
+        XCTAssertTrue(holdStep.state.isChargingInhibited)
+
+        // 2. Unplugged drift lowers lowWater from 77 -> 72 without publishing to powerd
+        let unpluggedStep = GovernorPolicy.evaluate(
+            config: cfg,
+            diskConfig: cfg,
+            state: holdStep.state,
+            memory: holdStep.memory,
+            battery: makeBattery(percent: 72, isAC: false, amperage: -600),
+            powerd: PowerdSnapshot(enforcedSoc: nil, reportedNoCeiling: true),
+            usesNativePowerUI: true,
+            now: now.addingTimeInterval(30)
+        )
+        XCTAssertEqual(unpluggedStep.effects, [])
+        XCTAssertEqual(unpluggedStep.memory.lowWater, 72)
+        XCTAssertEqual(unpluggedStep.state.activeTarget, 72)
+
+        // 3. Charging above target arms +1% chargeCatch and publishes immediately when powerd differs
+        let catchStep = GovernorPolicy.evaluate(
+            config: cfg,
+            diskConfig: cfg,
+            state: unpluggedStep.state,
+            memory: unpluggedStep.memory,
+            battery: makeBattery(percent: 72, isCharging: true, isAC: true, amperage: 900),
+            powerd: PowerdSnapshot(enforcedSoc: 80, reportedNoCeiling: false),
+            usesNativePowerUI: true,
+            now: now.addingTimeInterval(60)
+        )
+        XCTAssertEqual(catchStep.memory.chargeCatch, 73)
+        XCTAssertEqual(catchStep.effects, [.publishCeiling(limit: 73, delta: 3, force: false)])
+
+        // 4. Thermal throttling inhibits charging once and recovers on Nominal
+        let hotStep = GovernorPolicy.evaluate(
+            config: cfg,
+            diskConfig: cfg,
+            state: .initial,
+            memory: .initial,
+            battery: makeBattery(percent: 45, isCharging: true, isAC: true, amperage: 1200, thermal: "Serious (Throttled)"),
+            powerd: PowerdSnapshot(enforcedSoc: 50, reportedNoCeiling: false),
+            usesNativePowerUI: true,
+            now: now
+        )
+        XCTAssertTrue(hotStep.state.isThermalThrottled)
+        XCTAssertEqual(hotStep.effects, [.setChargingInhibited(true)])
+    }
+
+    func testISO8601FormatAndSocketIPCEdgeCases() {
+        XCTAssertEqual(ChargeReport.formatISO8601(Date(timeIntervalSince1970: 0)), "1970-01-01T00:00:00Z")
+
+        let sockPath = "/tmp/cp-ipc-\(UUID().uuidString.prefix(8)).sock"
+        let governor = AIGovernor()
+        let server = UnixSocketServer(socketPath: sockPath, governor: governor)
+        server.start()
+        defer { server.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let statusResp = UnixSocketClient.send("STATUS", socketPath: sockPath)
+        XCTAssertNotNil(statusResp)
+        XCTAssertTrue(statusResp?.contains("\"governor\"") == true)
+
+        let badLimit = UnixSocketClient.send("SET 10", socketPath: sockPath)
+        XCTAssertFalse(UnixSocketClient.isSuccess(badLimit))
+
+        let highLimit = UnixSocketClient.send("SET 105", socketPath: sockPath)
+        XCTAssertFalse(UnixSocketClient.isSuccess(highLimit))
+
+        let unknown = UnixSocketClient.send("BOGUS_CMD", socketPath: sockPath)
+        XCTAssertTrue(unknown?.contains("Unknown command") == true)
+
+        XCTAssertNil(UnixSocketClient.send("STATUS", socketPath: "/tmp/cp-nonexistent-\(UUID().uuidString.prefix(8)).sock"))
+    }
 }

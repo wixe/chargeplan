@@ -46,22 +46,27 @@ final class BatteryGraphView: NSView {
     
     func addSample(percent: Double, targetLimit: Int, isCharging: Bool, timestamp: Date = Date()) {
         if let last = samples.last, timestamp.timeIntervalSince(last.timestamp) < 0.5 {
-            // In-place update to prevent duplicate samples within 0.5s
             samples[samples.count - 1] = Sample(timestamp: timestamp, percent: percent, targetLimit: targetLimit, isCharging: isCharging)
-            needsDisplay = true
+            if window?.isVisible == true {
+                needsDisplay = true
+            }
             return
         }
-        
-        // Append actual recorded sample only — no artificial historical anchors
+
         samples.append(Sample(timestamp: timestamp, percent: percent, targetLimit: targetLimit, isCharging: isCharging))
-        
-        // Retain up to 24 hours of rolling history (86,400s)
-        let cutoff = timestamp.addingTimeInterval(-86400)
+
+        // Retain rolling window slightly larger than the 30m plot range (up to 2h, max 1,800 samples)
+        let cutoff = timestamp.addingTimeInterval(-max(selectedRangeSeconds * 2.0, 3600.0))
         if let idx = samples.firstIndex(where: { $0.timestamp >= cutoff }), idx > 0 {
             samples.removeFirst(idx)
         }
-        
-        needsDisplay = true
+        if samples.count > 1800 {
+            samples.removeFirst(samples.count - 1800)
+        }
+
+        if window?.isVisible == true {
+            needsDisplay = true
+        }
     }
     
     override func draw(_ dirtyRect: NSRect) {

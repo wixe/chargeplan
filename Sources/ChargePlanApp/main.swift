@@ -4,7 +4,28 @@ import ChargePlanCore
 
 @MainActor
 final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+    private struct DaemonSnapshot {
+        let running: Bool
+        let mode: String
+        let backend: String?
+        let version: String?
+        let hold: Int?
+        let targetLimit: Int?
+        let percent: Int?
+        let exactPercent: Double?
+        let isCharging: Bool?
+        let isACConnected: Bool?
+        let amperageMA: Int?
+    }
+
+    private struct MenuBarRenderState: Equatable {
+        let title: String
+        let isOrange: Bool
+    }
+
     private var statusItem: NSStatusItem!
+    private let statusMenu = NSMenu()
+    private var lastMenuBarRender: MenuBarRenderState?
     private var refreshTimer: Timer?
     private var windowTelemetryTimer: Timer?
     private var settingsWindow: NSWindow?
@@ -59,16 +80,15 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             button.title = "⚡ --%"
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         }
+        statusMenu.delegate = self
+        statusItem.menu = statusMenu
         
         // Enable Launch at Login by default on first run if installed in /Applications
         if Bundle.main.bundlePath.hasPrefix("/Applications") && !FileManager.default.fileExists(atPath: launchAgentPath) {
             setLaunchAtLogin(true)
         }
         
-        rebuildMenu()
-        
-        // Automatically ensure background daemon binary matches this app version
-        autoSyncDaemonIfNeeded()
+        backgroundTick()
         
         // Background check for updates (cached 24h, 0 overhead)
         Task {
@@ -82,9 +102,7 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.autoSyncDaemonIfNeeded()
-                self?.rebuildMenu()
-                self?.refreshSettingsWindow()
+                self?.backgroundTick()
             }
         }
     }
@@ -94,24 +112,91 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         return true
     }
     
-    private func fetchDaemonStatus() -> (running: Bool, mode: String, backend: String?, version: String?, hold: Int?) {
-        if let liveJson = UnixSocketClient.send("STATUS"),
-           let data = liveJson.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let gov = obj["governor"] as? [String: Any],
-           let mode = gov["mode"] as? String {
-            let backend = gov["backend"] as? String
-            let version = gov["version"] as? String
-            let hold = gov["hold_limit"] as? Int
-            return (true, mode, backend, version, hold)
+    private func fetchDaemonSnapshot() -> DaemonSnapshot {
+        autoreleasepool {
+            if let liveJson = UnixSocketClient.send("STATUS"),
+               let data = liveJson.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let gov = obj["governor"] as? [String: Any],
+               let mode = gov["mode"] as? String {
+                let batt = obj["battery"] as? [String: Any]
+                return DaemonSnapshot(
+                    running: true,
+                    mode: mode,
+                    backend: gov["backend"] as? String,
+                    version: gov["version"] as? String,
+                    hold: gov["hold_limit"] as? Int,
+                    targetLimit: gov["target_limit"] as? Int,
+                    percent: batt?["percent"] as? Int,
+                    exactPercent: batt?["exact_percent"] as? Double,
+                    isCharging: batt?["is_charging"] as? Bool,
+                    isACConnected: batt?["is_ac_connected"] as? Bool,
+                    amperageMA: batt?["amperage_ma"] as? Int
+                )
+            }
+            return DaemonSnapshot(
+                running: false,
+                mode: "Daemon Not Installed",
+                backend: nil,
+                version: nil,
+                hold: nil,
+                targetLimit: nil,
+                percent: nil,
+                exactPercent: nil,
+                isCharging: nil,
+                isACConnected: nil,
+                amperageMA: nil
+            )
         }
-        return (false, "Daemon Not Installed", nil, nil, nil)
     }
-    
+
+    private func fetchDaemonStatus() -> (running: Bool, mode: String, backend: String?, version: String?, hold: Int?) {
+        let snap = fetchDaemonSnapshot()
+        return (snap.running, snap.mode, snap.backend, snap.version, snap.hold)
+    }
+
+    /// Lightweight 5s background tick: zero NSMenu allocations when menu is closed,
+    /// single daemon IPC read, and deduplicated WindowServer button title updates.
+    private func backgroundTick() {
+        autoreleasepool {
+            let snap = fetchDaemonSnapshot()
+            autoSyncDaemonIfNeeded(snapshot: snap)
+
+            if snap.running,
+               let pct = snap.percent,
+               let exact = snap.exactPercent,
+               let charging = snap.isCharging,
+               let ac = snap.isACConnected {
+                let target = snap.targetLimit ?? ConfigManager.shared.load().targetLimit
+                let amp = snap.amperageMA ?? 0
+                let symbol = (charging || amp > 50) ? "⚡" : (ac ? "🔌" : "🔋")
+                applyMenuBarSummary(symbol: symbol, percent: pct, target: target, isACConnected: ac)
+                batteryGraphView.addSample(percent: exact, targetLimit: target, isCharging: charging)
+            } else {
+                let status = monitor.getCurrentStatus()
+                let cfg = ConfigManager.shared.load()
+                applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status)
+                batteryGraphView.addSample(percent: status.exactPercent, targetLimit: cfg.targetLimit, isCharging: status.isCharging)
+            }
+
+            if let win = settingsWindow, win.isVisible, !win.isMiniaturized {
+                refreshSettingsWindow(snapshot: snap)
+            }
+        }
+    }
+
     private func rebuildMenu() {
-        guard !menuIsOpen else { return }
+        guard menuIsOpen else {
+            backgroundTick()
+            return
+        }
+        populateMenu(statusMenu)
+    }
+
+    private func populateMenu(_ menu: NSMenu) {
         replacingMenu = true
         defer { replacingMenu = false }
+        menu.removeAllItems()
 
         let status = monitor.getCurrentStatus()
         let cfg = ConfigManager.shared.load()
@@ -121,9 +206,6 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let backendName = daemonInfo.backend ?? fallbackHardware.modeName
         let iconPrefix = menuBarSymbol(for: status)
         applyMenuBarTitle(percent: status.percent, target: cfg.targetLimit, status: status)
-        
-        let menu = NSMenu()
-        menu.delegate = self
         
         if let rel = latestRelease, UpdateChecker.isVersion(rel.version, newerThan: ChargePlanVersion) {
             let updateItem = NSMenuItem(title: "⬆️ Update Available (\(rel.tagName))…", action: #selector(triggerAppUpdate), keyEquivalent: "")
@@ -260,8 +342,12 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let quitItem = NSMenuItem(title: "Quit ChargePlan Menu Bar", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
-        
-        statusItem.menu = menu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        autoreleasepool {
+            populateMenu(menu)
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -270,9 +356,6 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     func menuDidClose(_ menu: NSMenu) {
         menuIsOpen = false
-        if !replacingMenu {
-            rebuildMenu()
-        }
     }
     
     @objc private func openProjectPage(_ sender: Any?) {
@@ -648,12 +731,12 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         return UpdateChecker.compareVersion(ver, ChargePlanVersion) != .orderedAscending
     }
     
-    private func autoSyncDaemonIfNeeded() {
+    private func autoSyncDaemonIfNeeded(snapshot: DaemonSnapshot? = nil) {
         guard !isAutoSyncingDaemon else { return }
         if lastAutoSyncAttempt != .distantPast, Date().timeIntervalSince(lastAutoSyncAttempt) < 60 {
             return
         }
-        let daemonInfo = fetchDaemonStatus()
+        let daemonInfo = snapshot ?? fetchDaemonSnapshot()
         guard daemonInfo.running else { return }
         let upToDate = isDaemonBinaryUpToDate(runningDaemonVersion: daemonInfo.version)
         guard !upToDate else { return }
@@ -681,14 +764,14 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
     }
     
-    private func refreshSettingsWindow() {
+    private func refreshSettingsWindow(snapshot: DaemonSnapshot? = nil) {
         guard let win = settingsWindow, win.isVisible, !win.isMiniaturized else { return }
         let status = monitor.getCurrentStatus()
         let cfg = ConfigManager.shared.load()
-        let daemonInfo = fetchDaemonStatus()
-        let daemonActive = daemonInfo.running
-        let upToDate = isDaemonBinaryUpToDate(runningDaemonVersion: daemonInfo.version)
-        let govMode = daemonInfo.mode
+        let daemonSnap = snapshot ?? fetchDaemonSnapshot()
+        let daemonActive = daemonSnap.running
+        let upToDate = daemonActive ? isDaemonBinaryUpToDate(runningDaemonVersion: daemonSnap.version) : false
+        let govMode = daemonSnap.mode
         
         if let notice = controlNotice, Date() < controlNoticeUntil {
             governorLabel?.stringValue = notice
@@ -1024,9 +1107,22 @@ final class ChargePlanAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     
     /// Orange while plugged in above the saved setpoint. The arrow still shows that setpoint.
     private func applyMenuBarTitle(percent: Int, target: Int, status: BatteryStatus) {
+        applyMenuBarSummary(
+            symbol: menuBarSymbol(for: status),
+            percent: percent,
+            target: target,
+            isACConnected: status.isACConnected
+        )
+    }
+
+    private func applyMenuBarSummary(symbol: String, percent: Int, target: Int, isACConnected: Bool) {
         guard let button = statusItem.button else { return }
-        let title = "\(menuBarSymbol(for: status)) \(percent)% → \(target)%"
-        let aboveSetpoint = status.isACConnected && percent > target
+        let title = "\(symbol) \(percent)% → \(target)%"
+        let aboveSetpoint = isACConnected && percent > target
+        let nextRender = MenuBarRenderState(title: title, isOrange: aboveSetpoint)
+        guard lastMenuBarRender != nextRender else { return }
+        lastMenuBarRender = nextRender
+
         let color: NSColor = aboveSetpoint ? .systemOrange : .labelColor
         let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
         button.attributedTitle = NSAttributedString(string: title, attributes: [

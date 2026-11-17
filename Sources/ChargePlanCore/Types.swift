@@ -1,6 +1,6 @@
 import Foundation
 
-public struct BatteryStatus: Codable {
+public struct BatteryStatus: Codable, Equatable, Sendable {
     public let percent: Int
     public let exactPercent: Double
     public let isCharging: Bool
@@ -135,7 +135,7 @@ public struct BatteryStatus: Codable {
     }
 }
 
-public struct GovernorConfig: Codable, Equatable {
+public struct GovernorConfig: Codable, Equatable, Sendable {
     public var targetLimit: Int
     public var driftEnabled: Bool
     public var driftMargin: Int
@@ -239,7 +239,7 @@ public struct GovernorConfig: Codable, Equatable {
     }
 }
 
-public struct GovernorState: Codable {
+public struct GovernorState: Codable, Equatable, Sendable {
     public var activeTarget: Int
     public var isChargingInhibited: Bool
     public var inDrift: Bool
